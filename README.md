@@ -17,7 +17,7 @@ flowchart TB
         BuildPatientInfo["build_patient_info"]
         BaseDF["base_df"]
         HistoricBaseDF[("data/interim/historic_base_df")]
-        subgraph PreProces["Model-specific pre-processing"]
+        subgraph PreProces["Model-specific<br>pre-processing"]
           ConstructDatasets["<b>construct_datasets</b><br>update tabular, update aggregation into bin_df"]
           TabularDS[/"`tabular_ds`"/]
           TimeseriesDS[/"`timeseries_ds`"/]
