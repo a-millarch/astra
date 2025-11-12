@@ -1,2 +1,44 @@
-# astra
-ASTRA - AI for Surgical Trauma Risk Assessment
+# ASTRA - AI for Surgical Trauma Risk Assessment
+<i>Center for Surgical Translational and Artificial Intelligence Research (CSTAR), Copenhagen University Hospital, Denmark</i>
+
+As a part of the ASTRA project by CSTAR, an ML-driven risk assessment tool for trauma patients is developed for implementation in the Eletronic Health Record (EHR) system at the Copenhagen University Hospital. 
+
+
+### Process graph
+```mermaid
+---
+config:
+  layout: dagre
+  theme: neo-dark
+  look: neo
+---
+flowchart TB
+ subgraph MainPipeline["<b>Pipeline Loop</b><br>(Periodic Update)"]
+        BuildPatientInfo["build_patient_info"]
+        BaseDF["base_df"]
+        HistoricBaseDF[("data/interim/historic_base_df")]
+        subgraph PreProces["Model-specific pre-processing"]
+          ConstructDatasets["<b>construct_datasets</b><br>update tabular, update aggregation into bin_df"]
+          TabularDS[/"`tabular_ds`"/]
+          TimeseriesDS[/"`timeseries_ds`"/]
+          Dataloaders["DataLoaders<br>(mixed)"]
+        end
+        Predict["predict"]
+        PredictionsDF[("data/output/predictions.csv")]
+  end
+    BuildPatientInfo --> BaseDF & BinDF["bin_df"]
+    HistoricFeatures["compute_historic_features"] <-- run once --> BuildPatientInfo
+    BaseDF --> HistoricBaseDF & ConstructDatasets
+    BinDF --> ConstructDatasets
+    ConstructDatasets --> TabularDS & TimeseriesDS
+    TabularDS --> Dataloaders
+    TimeseriesDS --> Dataloaders
+    Dataloaders --> Predict
+    Predict --> PredictionsDF
+    PredictionsDF -- wait interval --> BuildPatientInfo
+    TraumaCall(["`<u>Trauma Call Trigger</u>`"]) -- from DAP ETL --> dbIdTraumaCallCSV[("data/external/trauma_call.csv")]
+    dbIdTraumaCallCSV --> BuildPatientInfo
+    EndTrajectory(["`End Trajectory Trigger<br>(Discharge/Death)`"]) -- update message --> BuildPatientInfo
+    BuildPatientInfo -. final update .-> HistoricBaseDF
+    PredictionsDF <--> GUI_API[["`GUI API end-point`"]]
+```
