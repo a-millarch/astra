@@ -170,11 +170,11 @@ def format_step_label(step):
         return f"{days} day" + ("s" if days != 1 else "")
     
 
-def evaluate_over_time(df, censor_ts, learn, data):
+def evaluate_over_time(tsds, censor_ts, learn, data):
     results = []
     preds_over_time = []
     for censor_t in censor_ts:
-        dls = get_eval_mixed_dls(df, censor_t, data)
+        dls = get_eval_mixed_dls(tsds, censor_t, data)
         preds, targets = learn.get_preds(dl=dls.train)
         y_preds = preds[:, 1].numpy()
         ys = targets.numpy()
@@ -199,7 +199,7 @@ def evaluate_over_time(df, censor_ts, learn, data):
             "AP_CI": (ap_lower, ap_upper)
         })
         
-        patient_ids = df.base.PID.values
+        patient_ids = tsds.base.PID.values
         for pid, pred in zip(patient_ids, y_preds):
             preds_over_time.append({
                 "PID": pid,
@@ -211,14 +211,14 @@ def evaluate_over_time(df, censor_ts, learn, data):
     return results, pd.DataFrame(preds_over_time)
 
 ### Model specific plot functions
-def plot_multiple_evaluations(df, censor_ts, learn, labels=None):
+def plot_multiple_evaluations(tsds, censor_ts, learn, data, labels=None):
     fig, (ax_roc, ax_pr) = plt.subplots(1, 2, figsize=(12, 5))
     
     #colors = plt.cm.tab10(np.linspace(0, 1, len(censor_ts)))
     colors =['#1F77B4','#FF7F0E','#2CA02C','#D62728','#9467BD','#8C564B','#E377C2','#7F7F7F','#BCBD22','#17BECF']
     
     for i, censor_t in enumerate(censor_ts):
-        dls = get_eval_mixed_dls(df, censor_t)
+        dls = get_eval_mixed_dls(tsds, censor_t, data)
         preds, targets = learn.get_preds(dl=dls.train)
         
         y_preds = preds[:, 1]  # Assuming class 1 probability
@@ -393,11 +393,10 @@ def run_eval(data, model_name: str, comprehensive_eval: bool = True):
         time_to_step(7, 'D'),
         time_to_step(14, 'D'),
          #time_to_step(21, 'D'),   
-         #time_to_step(30, 'D'),   
-        123
+        time_to_step(30, 'D')
         ]
         censor_thresholds.reverse()
         labels = [format_step_label(step) for step in censor_thresholds]
-        multi_curve = plot_multiple_evaluations(data["holdout_mixed_dls"], censor_thresholds, learn, labels=labels)
+        multi_curve = plot_multiple_evaluations(holdout, censor_thresholds, learn, data,labels=labels)
        
         return results, preds_df
