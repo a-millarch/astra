@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "astra"
+version = "0.0.1"
+description = "ASTRA"
+authors = [
+  { name = "Andreas Skov Millarch", email = "andreasmillarch@gmail.com" },
+]
+
+
+[tool.setuptools]
+packages = ["astra"]

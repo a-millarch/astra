@@ -1,0 +1,620 @@
+import pandas as pd
+import numpy as np
+import subprocess
+
+from astra.utils import logger, cfg, get_base_df, create_enumerated_id, is_file_present
+from astra.utils import ensure_datetime,count_csv_rows, inches_to_cm, ounces_to_kg
+from astra.data.collectors import collect_procedures, population_filter_parquet
+
+from azureml.core import Dataset
+
+def create_base_df(cfg, result_path = "data/interim/base_df.pkl"):
+    logger.info("Creating base dataframe")
+
+    population = load_or_collect_population(cfg)
+    df_ad = load_or_collect_adt(cfg, population)
+    of = build_trajectories(df_ad)
+
+    population = ensure_datetime(population, "ServiceDate")
+    matched = match_population_to_trajectories(of, population)
+    
+    merged_df = add_first_contacts(matched, df_ad)
+    merged_df =  add_first_hospital(merged_df)
+    
+    result = add_patient_info(merged_df, population)
+    result = add_patient_id(result)
+    result = final_cleanup(result)
+
+    # Add statics
+    result = add_to_base(result)
+    # add Elixhauser
+    result = add_elixhauser(result) 
+    
+    logger.info(f"Saving file at{result_path}")
+    result.to_pickle(result_path)
+    return result
+
+def map_data(cfg):
+
+    map_dir = "data/interim/mapped/"
+    for concept in cfg["concepts"]:
+        for agg_func in cfg["agg_func"][concept]:
+            if is_file_present(
+                f"{map_dir}{concept}_{agg_func}.csv"
+            ) and is_file_present(f"{map_dir}{concept}_{agg_func}.pkl"):
+                pass
+            else:
+                logger.info(f"Binning and mapping {concept} with agg_func: {agg_func}")
+                map_concept(cfg, concept, agg_func)
+
+def define_historic_population(cfg=cfg):
+    path = f'{cfg["raw_file_path"]}CPMI_Procedurer.parquet'
+    df_procedure = Dataset.Tabular.from_parquet_files(path=path)
+    dtr_procedure = df_procedure.to_pandas_dataframe()
+    traumepatienter = dtr_procedure[dtr_procedure["ProcedureCode"] == "BWST1F"][
+        ["CPR_hash", "ServiceDate"]
+    ]
+    traumepatienter.to_csv(cfg["population_file_path"])
+
+def define_single_patient(cfg):
+    # JUST A TEMPORARY TESTER FUNCTION, used by load_or_collect_population
+    
+    pd.DataFrame.from_dict({'CPR_hash':['FFFB69AEF2D7DED6288C835FE45672455D6E68F1F725207109750F772EDC68C4'],
+    'ServiceDate':[np.datetime64('2023-08-20T15:21:00.000000000')]}, orient='columns').to_csv(cfg["trauma_call_file_path"])
+    
+   
+
+def load_or_collect_population(cfg):
+    if cfg["single_patient_mode"] is True:
+        logger.debug("Single patient mode")
+        while True:
+            try:
+                logger.debug("Read patient seed file")
+                return pd.read_csv(cfg["trauma_call_file_path"], index_col=0)
+            except FileNotFoundError:
+                logger.warning("Patient seed file not found!")
+                define_single_patient(cfg)
+    else:
+        logger.debug("Population mode")
+        while True:
+            try:
+                logger.debug("Read population seed file")
+                return pd.read_csv(cfg["population_file_path"], index_col=0)
+            except FileNotFoundError:
+                logger.warning("Population seed file not found!")
+                define_historic_population(cfg)        
+
+def load_or_collect_adt(cfg, population):
+    path = "data/raw/ADTHaendelser.csv"
+    while True:
+        try:
+            logger.debug("Loading ADT")
+            df_ad = pd.read_csv(path, dtype={"CPR_hash": str}, index_col=0)
+            break
+        except FileNotFoundError:
+            logger.warning("ADT file not found. Loading.")
+            population_filter_parquet("ADTHaendelser", cfg=cfg, base=population)
+
+    df_ad[["Flyt_ind", "Flyt_ud"]] = df_ad[["Flyt_ind", "Flyt_ud"]].apply(
+        pd.to_datetime, format="mixed", errors="coerce"
+    )
+    df_ad.loc[df_ad.ADT_haendelse == "Flyt Ind", "Flyt_ind"] += pd.Timedelta(seconds=1)
+
+    return df_ad.sort_values(["CPR_hash", "Flyt_ind"]).reset_index(drop=True)
+
+
+def build_trajectories(df_ad):
+    """
+    Builds patient trajectories from ADT admission events by assigning trajectory numbers and
+    collapsing consecutive admissions per patient using a time gap threshold (default: 1 hour).
+    Parameters:
+    - df_ad (pd.DataFrame): ADT events with Flyt_ind, Flyt_ud, and CPR_hash.
+ 
+    Returns:
+    - pd.DataFrame: Collapsed trajectories with start, end, duration, and combined trajectory IDs.
+    """
+    logger.info(">Building trajectories")
+ 
+    # Tildel unik trajectory ID til hver 'Indlæggelse' hændelse
+    df_ad["trajectory"] = (
+        df_ad[df_ad["ADT_haendelse"] == "Indlæggelse"]
+        .groupby("CPR_hash")
+        .cumcount() + 1
+    )
+    df_ad["trajectory"] = df_ad["trajectory"].ffill()
+ 
+    # Filtrer nødvendige kolonner og sorter
+    df_ad = df_ad[["CPR_hash", "trajectory", "Flyt_ind", "Flyt_ud"]].copy()
+    df_ad = df_ad.rename(columns={"Flyt_ind": "start", "Flyt_ud": "end"})
+ 
+    # Kør den optimerede collapse-admissions
+    of = collapse_admissions(df_ad, time_gap_hours=1)
+ 
+    return of
+
+
+def match_population_to_trajectories(of, population):
+    logger.info("Matcher procedurer til trajectories.")
+    fdf = find_forløb(of, population, "ServiceDate")
+    df = pd.merge(
+        fdf[["CPR_hash", "trajectory", "ServiceDate"]],
+        of,
+        on=["CPR_hash", "trajectory"],
+        how="left"
+    )
+    return df
+
+
+def add_first_contacts(df, df_adt):
+    """
+    Matches department admissions to trajectories and classifies visitation type. Finds the first department contact and first RH contact within each trajectory. Calculates time to first RH contact 
+    and assigns visitation type: 'primær', 'sekundær', or 'primær ingen RH'.
+    """ 
+    logger.info("Finder første afsnit og RH kontakt.")
+    merged = df_adt.merge(df[["CPR_hash", "ServiceDate", "start", "end"]], on="CPR_hash")
+    filtered = merged[(merged["Flyt_ind"] >= merged["start"]) & (merged["Flyt_ind"] <= merged["end"])]
+
+    first_afsnit = filtered.groupby(["CPR_hash", "ServiceDate", "start"]).first().reset_index()
+
+    first_RH = filtered[
+        filtered["Afsnit"].str.contains("RH ", case=False, na=False)
+    ].groupby(["CPR_hash", "ServiceDate", "start"]).first().reset_index()
+
+    first_RH = first_RH[["CPR_hash", "Flyt_ind", "ServiceDate", "start"]].rename(columns={"Flyt_ind": "first_RH"})
+
+    result = pd.merge(first_afsnit, first_RH, on=["CPR_hash", "ServiceDate", "start"], how="left")
+    result = result.rename(columns={"Afsnit": "first_afsnit"})
+
+    result["time_to_RH"] = result["first_RH"] - result["start"]
+
+    # Visitationstype
+    result["type_visitation"] = "primær ingen RH" #default
+    result.loc[result["first_afsnit"].str.contains("RH TRAUMECENTER", na=False), "type_visitation"] = "primær"
+    result.loc[
+        (~result["first_afsnit"].str.contains("RH TRAUMECENTER", na=False)) & result["first_RH"].notnull(),
+        "type_visitation"
+    ] = "sekundær"
+
+    return result
+
+
+
+def standardize_hospital(name ,valid_hospitals = ["RH", "AHH", "HGH", "NOH", "BFH", "BOH", "RHP", "SJ KØGE", 
+                   "SJ HOLBÆK", "SJ NYKØBING", "SJ ROSKILDE", "SJ VORDINGBORG", 
+                   "SJ NÆSTVED", "SJ SLAGELSE"]):
+    if pd.isna(name):
+        return np.nan
+    name = str(name).strip().upper()
+    
+    # Special cases for partial matches
+    if name.startswith('SJ HOL'):
+        return 'SJ HOLBÆK'
+    if name.startswith('SJ ROS'):
+        return 'SJ ROSKILDE'
+    
+    # Exact match check (case-insensitive)
+    if name in [h.upper() for h in valid_hospitals]:
+        for h in valid_hospitals:
+            if name == h.upper():
+                return h  # Preserve original casing
+    
+    return 'MISC'
+
+def first_hospital(name):
+    if pd.isna(name):
+        return name
+    words = str(name).strip().split()
+    if words and words[0] == 'SJ':
+        return ' '.join(words[:2])
+    elif words:
+        return words[0]
+    return ''
+
+def add_first_hospital(df):
+    # First, remove commas from FIRST_HOSPITAL (or source column before extraction)
+    df['first_afsnit'] = df['first_afsnit'].str.replace(',', '', regex=False)
+
+    df['FIRST_HOSPITAL'] = df['first_afsnit'].apply(first_hospital)
+    df['FIRST_HOSPITAL'] = df['FIRST_HOSPITAL'].apply(standardize_hospital)
+    print(df.FIRST_HOSPITAL.value_counts())
+    return df
+
+
+def add_patient_info(df, population):
+    logger.info("Tilføjer patientinformation.")
+    population_filter_parquet("PatientInfo", base=population)
+    pi = pd.read_csv("data/raw/PatientInfo.csv", index_col=0)
+    pi = pi.rename(columns={"Fødselsdato": "DOB", "Dødsdato": "DOD", "Køn": "SEX"})
+    pi["SEX"] = pi["SEX"].replace({"Mand": "Male", "Kvinde": "Female"})
+
+    df = df.merge(pi[["CPR_hash", "DOB", "DOD", "SEX"]], on="CPR_hash", how="left")
+    df["overlap"] = df.groupby("CPR_hash", group_keys=False).apply(check_overlaps).explode().values
+
+    return df
+
+
+def add_patient_id(df):
+    logger.info("Opretter PID.")
+    return create_enumerated_id(df, "CPR_hash", "ServiceDate")
+
+
+def final_cleanup(df):
+    logger.info("Rydder op i dataframe.")
+    df = df[df["start"].notnull() & df["end"].notnull()]
+    df = df.drop(columns=["Flyt_ind", "Flyt_ud", "ADT_haendelse"], errors='ignore')
+    df = df.drop_duplicates(subset="PID").reset_index(drop=True)
+    df = df.drop_duplicates(subset=["CPR_hash", "start", "end"]).reset_index(drop=True)
+    return df
+
+
+def collapse_admissions(df: pd.DataFrame, time_gap_hours: int = 1) -> pd.DataFrame:
+    df["start"] = pd.to_datetime(df["start"])
+    df["end"] = pd.to_datetime(df["end"])
+    df = df.sort_values(["CPR_hash", "start"]).reset_index(drop=True)
+
+    collapsed = df.groupby("CPR_hash").apply(
+        lambda group: _collapse_patient_admissions(group, time_gap_hours)
+    , include_groups=True).reset_index(drop=True)
+
+    return collapsed
+
+
+def _collapse_patient_admissions(group: pd.DataFrame, time_gap_hours: int) -> pd.DataFrame:
+    group = group.sort_values("start").copy()
+    group["prev_end"] = group["end"].shift()
+    group["gap"] = group["start"] - group["prev_end"]
+
+    gap_thresh = pd.Timedelta(hours=time_gap_hours)
+    group["group_id"] = (group["gap"] >= gap_thresh).cumsum()
+
+    collapsed = (
+        group.groupby("group_id")
+        .agg({
+            "CPR_hash": "first",
+            "start": "min",
+            "end": "max",
+            "trajectory": lambda x: ",".join(map(str, x)),
+        })
+        .reset_index(drop=True)
+    )
+    collapsed["duration"] = collapsed["end"] - collapsed["start"]
+    return collapsed
+
+
+def find_forløb(
+    base: pd.DataFrame, df: pd.DataFrame, dt_name: str, offset=1
+) -> pd.DataFrame:
+    """
+    Matcher observations in df to trajectories in base based on date overlap with optional offset. Filters the observations so that only rows where the date (dt_name) falls within the trajectory's 
+start and end dates (extended by the specified offset in both directions) are retained.
+    """
+    
+    # save colnames for return
+    colnames = df.columns.to_list()
+    # ensure datetime format for input df
+    df = ensure_datetime(df, dt_name)
+    # merge and filter
+    merged_df = base.merge(df, on="CPR_hash", how="left")
+
+    filtered_df = merged_df[
+        (merged_df[dt_name] >= merged_df["start"] - pd.DateOffset(days=offset))
+        & (merged_df[dt_name] <= merged_df["end"] + pd.DateOffset(days=offset))
+    ]
+    filtered_df = filtered_df.drop_duplicates().reset_index(drop=True)
+
+    return filtered_df[colnames + ["trajectory"]]
+
+
+def check_overlaps(group):
+    """Checks for overlapping in start - end of trajectories for same patient in groupby object
+
+    usage example:
+    df['overlap'] = df.groupby('CPR_hash').apply(check_overlaps).explode().reset_index(drop=True)
+
+    """
+    overlaps = []
+    for i in range(len(group) - 1):
+        # Check if the current end_time overlaps with the next start_time
+        if group.iloc[i]["end"] > group.iloc[i + 1]["start"]:
+            overlaps.append(True)
+        else:
+            overlaps.append(False)
+    # Append False for the last entry as it has no next entry to compare
+    overlaps.append(False)
+    return overlaps
+
+def create_bin_df(cfg):
+    """
+    Generate time bins for each patient trajectory based on configurable binning intervals.
+
+    For each patient (PID) in the base dataset, the function iterates over the trajectory start and end times,
+    and divides the trajectory into time intervals ("bins") according to rules defined in cfg["bin_intervals"].
+    These bins can have varying frequencies depending on the duration of the trajectory.
+    """
+    logger.info("Generating bin_df")
+    bin_list = []
+    base = get_base_df()
+
+    # Load bin intervals from cfg
+    bin_intervals = cfg["bin_intervals"]
+
+    for _, row in base.iterrows():
+        start_time = row["start"]
+        end_time = row["end"] + pd.Timedelta(minutes=10)
+        pid = row["PID"]
+
+        current_time = start_time
+        bin_counter = 1
+
+        for interval, freq in bin_intervals.items():
+            if current_time >= end_time:
+                break
+
+            # Determine the end time for this interval
+            if interval == "end":
+                interval_end = end_time
+            else:
+                interval_end = start_time + pd.Timedelta(interval)
+
+            # Create bins for this interval
+            bins = pd.date_range(
+                start=current_time,
+                end=min(interval_end, end_time),
+                freq=freq,
+                inclusive="left",
+            )
+
+            # Add bins to the list
+            bin_list.extend(
+                [
+                    (pid, bin_start, bin_end, bin_counter + i, freq)
+                    for i, (bin_start, bin_end) in enumerate(zip(bins[:-1], bins[1:]))
+                ]
+            )
+
+            # Update the current time and bin counters
+            current_time = bins[-1]
+            bin_counter += len(bins) - 1
+
+    # Create DataFrame from bin list
+    bin_df = pd.DataFrame(
+        bin_list, columns=["PID", "bin_start", "bin_end", "bin_counter", "bin_freq"]
+    )
+
+    # Save DataFrame to pickle file
+    bin_df.to_pickle(cfg["bin_df_path"])
+    logger.info(f'>> Saved at {cfg["bin_df_path"]}')
+
+    return bin_df
+
+
+
+############
+def add_to_base(base):
+
+    base["DURATION"] = (base.end - base.start) / np.timedelta64(1, "D")
+
+    base["AGE"] = (
+        np.floor(
+            (pd.to_datetime(base["start"]) - pd.to_datetime(base.DOB)).dt.days / 365.25
+        )
+    ).astype(int)
+
+    base = add_height_weight(base)
+    # Mortality
+    base.loc[
+        (pd.to_datetime(base.DOD) - pd.to_datetime(base.start))
+        <= pd.Timedelta(days=30),
+        "deceased_30d",
+    ] = 1
+    base["deceased_30d"] = base["deceased_30d"].fillna(0)
+
+    base.loc[
+        (pd.to_datetime(base.DOD) - pd.to_datetime(base.start))
+        <= pd.Timedelta(days=90),
+        "deceased_90d",
+    ] = 1
+    base["deceased_90d"] = base["deceased_90d"].fillna(0)
+    # If trauma bay RH
+    base["LVL1TC"] = 0
+    base.loc[base.first_RH.notnull(), "LVL1TC"] = 1
+
+    return base
+
+
+def prepare_long_df(base):
+    diag = pd.read_csv("data/raw/Diagnoser.csv")
+
+    diag["Noteret_dato"] = pd.to_datetime(diag["Noteret_dato"])
+
+    merged_df = base[["CPR_hash", "PID", "AGE", "start", "end"]].merge(
+        diag, on="CPR_hash", how="left"
+    )
+
+    # Filtering rows where Noteret_dato is between start and end
+    filtered_df = merged_df[
+        (merged_df["Noteret_dato"] >= merged_df["start"] - pd.DateOffset(days=1))
+        & (merged_df["Noteret_dato"] <= merged_df["end"] + pd.DateOffset(days=1))
+    ]
+
+    # Adjust Diagnosekode by removing the first and last character for ICD10 conversion
+    filtered_df["Diagnosekode"] = filtered_df["Diagnosekode"].str.slice(1, -1)
+
+    # Now, checking how many unique combinations are there
+    logger.info(
+        f"Unique CPR_hash-ServiceDate combinations in df1:{base.groupby('PID').ngroups}"
+    )
+    logger.info(
+        f"Result after merging and filtering: {filtered_df.groupby('PID').ngroups}"
+    )
+
+    # Group by CPR_hash and apply a function to create new columns for each Diagnosekode
+    def enumerate_diagnoses(group):
+        diagnoses = group["Diagnosekode"].tolist()
+        for i, diag in enumerate(diagnoses, start=1):
+            group[f"ICD10_{i}"] = diag
+        return group
+
+    # Applying the function
+    result_df = filtered_df.groupby("PID").apply(enumerate_diagnoses)
+
+    # Dropping duplicates if necessary (since each row is expanded per group)
+    result_df = result_df.drop_duplicates(subset="PID").reset_index(drop=True)
+
+    result_df.to_csv("data/interim/ISS_ELIX/diagnoses_long.csv")
+
+
+
+
+def add_iss(base):
+    """Add ISS and Elixhauser by R"""
+    #output_df["TRISS"] = np.nan
+    
+    # Create long df if not there
+    if is_file_present("data/interim/diagnoses_long.csv"):
+        logger.info("Long diagnose df dataframe found, continuing")
+    else:
+        logger.info("No long diagnose file, creating.")
+        prepare_long_df(base)
+    logger.info("Calling R script to create ISS df at data/interim/ISS_ELIX/iss_df.csv")
+    subprocess.call("Rscript src/R/iss.r", shell=True)
+    logger.info("R subprocess finished")
+
+
+
+
+def prepare_height_weight(base):
+    vit_raw = pd.read_csv("data/raw/VitaleVaerdier.csv", index_col=0)
+    hw_map = {"Højde": "HEIGHT", "Vægt": "WEIGHT"}
+    vit_raw.rename(
+        columns={
+            "Værdi": "VALUE",
+            "Vital_parametre": "FEATURE",
+            "Registreringstidspunkt": "TIMESTAMP",
+        },
+        inplace=True,
+    )
+
+    vit_raw["FEATURE"] = vit_raw["FEATURE"].replace(to_replace=hw_map)
+    vit_raw.loc[vit_raw.FEATURE == "HEIGHT", "VALUE"] = inches_to_cm(
+        vit_raw[vit_raw.FEATURE == "HEIGHT"].VALUE.astype(float)
+    )
+    vit_raw.loc[vit_raw.FEATURE == "WEIGHT", "VALUE"] = ounces_to_kg(
+        vit_raw[vit_raw.FEATURE == "WEIGHT"].VALUE.astype(float)
+    )
+    hw = vit_raw[(vit_raw.FEATURE.isin(list(set(hw_map.values()))))]
+    assert len(hw)>0
+    hw = hw.merge(base[["PID", "CPR_hash", "start", "end"]], on="CPR_hash", how="left")
+    hw["TIMESTAMP"] = pd.to_datetime(hw.TIMESTAMP)
+    hw = hw[hw.TIMESTAMP <= hw.end]
+    hw = hw.sort_values(["CPR_hash", "TIMESTAMP"], ascending=False).drop_duplicates(
+        subset=["CPR_hash", "FEATURE"], keep="first"
+    )
+    #hw = hw[hw.delta.dt.days < 365 * 2]
+    hw[["TIMESTAMP", "PID", "FEATURE", "VALUE"]].to_pickle(
+        "data/interim/Height_Weight.pkl"
+    )
+
+
+def add_height_weight(base):
+    try: 
+        hw = pd.read_pickle("data/interim/Height_Weight.pkl")
+    except FileNotFoundError:
+        prepare_height_weight(base)
+        hw = pd.read_pickle("data/interim/Height_Weight.pkl")
+        
+    hw_df = hw.sort_values("TIMESTAMP").drop_duplicates(
+        subset=["PID", "FEATURE"], keep="first"
+    )
+    pivot_df = hw_df.pivot(
+        index=["PID"], columns="FEATURE", values="VALUE"
+    ).reset_index()
+    base = base.merge(pivot_df, how="left", on="PID")
+
+    return base
+
+
+def prepare_elix_df(base):
+    diag = pd.read_csv("data/raw/Diagnoser.csv")
+    assert len(diag) >0
+    diag["Noteret_dato"] = pd.to_datetime(diag["Noteret_dato"])
+    diag["Løst_dato"] = pd.to_datetime(diag["Løst_dato"])
+
+    merged_df = base[["CPR_hash", "PID", "AGE", "start", "end"]].merge(
+        diag, on="CPR_hash", how="left"
+    )
+    
+    logger.info("Preparing Elixhauser Df")
+    # Where noted date is before trauma AND not solved before trauma.
+    e_df = merged_df[
+        (merged_df["Noteret_dato"] <= merged_df["start"] - pd.DateOffset(days=1))
+        &     ((merged_df["Løst_dato"].isnull() |
+              ( merged_df["Løst_dato"].notnull() & 
+               (merged_df["Løst_dato"] >= merged_df["start"] + pd.DateOffset(days=1)))
+             )
+        )
+    ]
+
+    # Adjust Diagnosekode by removing the first and last character for ICD10 conversion
+    e_df["Diagnosekode"] = e_df["Diagnosekode"].str.slice(1, -1)
+
+    # Now, checking how many unique combinations are there
+    logger.info(
+        f"Unique CPR_hash-ServiceDate combinations in df1: {base.groupby('PID').ngroups}"
+    )
+
+    logger.info(f"Result after merging and filtering: {e_df.groupby('PID').ngroups}")
+    e_df[["PID", "AGE", "Diagnosekode"]].to_csv("data/interim/pre_elix_df.csv")
+
+
+
+def create_elixhauser(base):
+    pre_elix_path = "data/interim/pre_elix_df.csv"
+    if is_file_present(pre_elix_path):
+        logger.info("Elixhauser diagnose df dataframe found, continuing")
+            
+    else:
+        logger.info("No Elixhauser diagnose file, creating.")
+        prepare_elix_df(base)
+        
+    if count_csv_rows(pre_elix_path) > 0:
+        logger.info(">Calling R script to create Elixhauser df at data/interim/")
+        subprocess.call("Rscript astra/R/elixhauser.r", shell=True)
+        logger.info("R subprocess finished")
+    else: 
+        logger.info(">No prior diagnoses, elixscore is null")
+        output_df=base[['CPR_hash',"PID"]].copy(deep=True) #also CPR_hash?
+        output_df["elixscore"] = np.nan
+        
+        output_df.to_csv("data/interim/computed_elix_df.csv")
+
+def add_elixhauser(base, cols_to_add=["ASMT_ELIX", ]):    
+    """ Check if elix_df is present, if not then compute it with prepare elix_df (requires data/raw/Diagnoser.csv)
+    """
+    while True:
+        try:
+            elix = pd.read_csv(
+                "data/interim/computed_elix_df.csv", low_memory=False
+            )
+            logger.info("Elixhauser df dataframe found, continuing")
+            baselen = len(base)
+            # merge
+            elix=elix.rename(columns={'elixscore':'ASMT_ELIX'})
+            base = base.merge(
+                elix[["PID", ]+cols_to_add], how="left", on="PID"
+            )
+            assert baselen - len(base) == 0
+            logger.info("Merged Elix onto base")
+            return base
+        # TODO: merge onto base
+        except FileNotFoundError:
+            logger.info("DF missing.")
+            create_elixhauser(base)
+            continue
+        break
+
+
+
+if __name__ == "__main__":
+    create_base_df(cfg)
+    create_bin_df(cfg)
