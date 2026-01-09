@@ -12,7 +12,7 @@ def create_base_df(cfg, result_path = "data/interim/base_df.pkl"):
     logger.info("Creating base dataframe")
 
     population = load_or_collect_population(cfg)
-    df_ad = load_or_collect_adt(cfg, population)
+    df_ad = load_or_collect_adt(population)
     of = build_trajectories(df_ad)
 
     population = ensure_datetime(population, "ServiceDate")
@@ -84,7 +84,7 @@ def load_or_collect_population(cfg):
                 logger.warning("Population seed file not found!")
                 define_historic_population(cfg)        
 
-def load_or_collect_adt(cfg, population):
+def load_or_collect_adt( population):
     path = "data/raw/ADTHaendelser.csv"
     while True:
         try:
@@ -93,7 +93,7 @@ def load_or_collect_adt(cfg, population):
             break
         except FileNotFoundError:
             logger.warning("ADT file not found. Loading.")
-            population_filter_parquet("ADTHaendelser", cfg=cfg, base=population)
+            population_filter_parquet("ADTHaendelser", base=population)
 
     df_ad[["Flyt_ind", "Flyt_ud"]] = df_ad[["Flyt_ind", "Flyt_ud"]].apply(
         pd.to_datetime, format="mixed", errors="coerce"

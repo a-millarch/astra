@@ -16,8 +16,8 @@ from astra.data.datasets import TSDS
 def generate_base_df():
     # JUST A TEMPORARY TESTER FUNCTION, used by load_or_collect_population
     
-    pd.DataFrame.from_dict({'CPR_hash':['FFFB69AEF2D7DED6288C835FE45672455D6E68F1F725207109750F772EDC68C4'],
-    'ServiceDate':[np.datetime64('2023-08-20T15:21:00.000000000')]}, orient='columns').to_csv('data/external/trauma_call.csv')
+    pd.DataFrame.from_dict({'CPR_hash':['CENSORED'],
+    'ServiceDate':[np.datetime64('2026-0120T00:00:00.000000000')]}, orient='columns').to_csv('data/external/trauma_call.csv')
     
    
     # saved as pickle
@@ -62,8 +62,8 @@ if __name__ =='__main__':
     pm = ProjectManager()
     logger = pm.setup_logging(print_only=True)
     #generate_base_df() #Simulates new patient drop
-    #bpi.load_or_collect_population(cfg)
-    # 
+  
+
     population = bpi.load_or_collect_population(cfg)
     proces_raw_concepts(cfg, base=population)
     

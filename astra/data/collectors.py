@@ -106,12 +106,15 @@ def chunk_filter_parquet(filename, base = None, chunk_size = 4000000):
     logger.info(f'Finished, saved file at: {output_path}')
         
     
-def population_filter_parquet(filename,cfg = cfg, base =None):
+def population_filter_parquet(filename, base =None, blobstore_uri=None):
     if base is None:
         base = get_base_df()
+    if blobstore_uri is None:
+        blobstore_uri = 'https://forskerpln0ybkrdls01.blob.core.windows.net/sp-data/' # CHANGE TO SECRET?
     
     logger.info(f'Collecting and filtering {filename}')
-    path = f'{cfg["raw_file_path"]}CPMI_{filename}.parquet'
+    path = f'{blobstore_uri}CPMI_{filename}.parquet'
+    #path = f'data/raw/CPMI_{filename}.parquet'
     ds = Dataset.Tabular.from_parquet_files(path=path)
     df = ds.to_pandas_dataframe()
     # if single mode then use ds class to filter?

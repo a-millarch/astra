@@ -1,4 +1,7 @@
 from astra.utils import logger, cfg, get_concept
+
+
+
 import pandas as pd
 
 class TSDS:
@@ -51,6 +54,39 @@ class TSDS:
             self.vitals.iloc[:, :-1] = self.vitals.iloc[:, :-1].ffill(axis=1)
             # for target and if ffill not available
             self.vitals = self.vitals.fillna(0.0)
+
+
+class HistoricDS:
+    def __init__(self, cfg, base_df):
+        self.cfg = cfg
+        self.base = base_df
+        self.target = cfg["target"]
+        self.tab_df = self.base[[cfg["dataset"]["id_col"],cfg["target"]]+cfg["dataset"]["num_cols"]+cfg["dataset"]["cat_cols"]]
+        self.tab_df[cfg["dataset"]["num_cols"]] = self.tab_df[cfg["dataset"]["num_cols"]].astype(float)
+        logger.debug(self.base.columns)
+    
+    def add_comorbidity(self):
+        """Add Elixhauser and ISS to base"""
+        
+        # ELIXHAUSER    
+        while True:
+            try:
+                elix = pd.read_csv('data/interim/ISS_ELIX/computed_elix_df.csv',
+                                   low_memory =False)
+                logger.info('Elixhauser df dataframe found, continuing') 
+                baselen =len(self.base)
+                # merge
+                self.base= self.base.merge(elix[["PID", "elixscore"]], 
+                                           how='left', on='PID')
+                assert baselen-len(self.base) == 0
+                logger.info('Merged Elix onto base')
+            # TODO: merge onto base
+            except FileNotFoundError:
+                logger.info('No Elixhauser computed, creating.')
+                add_elixhauser(self.base)
+                continue
+            break
+           
 
 
 def get_long_concept_df(
