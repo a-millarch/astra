@@ -5,6 +5,9 @@ import subprocess
 from astra.utils import logger, cfg, get_base_df, create_enumerated_id, is_file_present
 from astra.utils import ensure_datetime,count_csv_rows, inches_to_cm, ounces_to_kg
 from astra.data.collectors import collect_procedures, population_filter_parquet
+from astra.data.mapper import map_concept
+
+from typing import List, Dict, Optional, Union
 
 from azureml.core import Dataset
 
@@ -33,9 +36,9 @@ def create_base_df(cfg, result_path = "data/interim/base_df.pkl"):
     logger.info(f"Saving file at{result_path}")
     result.to_pickle(result_path)
     return result
-
+    
 def map_data(cfg):
-
+    logger.info("Mapping data to bins")
     map_dir = "data/interim/mapped/"
     for concept in cfg["concepts"]:
         for agg_func in cfg["agg_func"][concept]:
@@ -44,8 +47,14 @@ def map_data(cfg):
             ) and is_file_present(f"{map_dir}{concept}_{agg_func}.pkl"):
                 pass
             else:
-                logger.info(f"Binning and mapping {concept} with agg_func: {agg_func}")
-                map_concept(cfg, concept, agg_func)
+                logger.debug(f"Binning and mapping {concept} with agg_func: {agg_func}")
+                if concept in cfg["dataset"]["ts_cat_names"]:
+                    is_categorical = True
+                    is_multi_label =True
+                else:
+                    is_categorical = False
+                    is_multi_label =False                    
+                map_concept(cfg, concept, agg_func, is_categorical, is_multi_label)
 
 def define_historic_population(cfg=cfg):
     path = f'{cfg["raw_file_path"]}CPMI_Procedurer.parquet'
