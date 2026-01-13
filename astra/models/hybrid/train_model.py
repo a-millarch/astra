@@ -1,6 +1,6 @@
 import argparse
 
-from astra.utils import logger
+from astra.utils import logger, cfg, logger
 from astra.evaluation.hybrid_model import run_eval
 
 from astra.data.dataloader import prepare_data_and_dls
@@ -36,7 +36,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    data = prepare_data_and_dls()
+    data = prepare_data_and_dls(cfg)
     pretrain_cfg = None
     
     if args.pretrain:

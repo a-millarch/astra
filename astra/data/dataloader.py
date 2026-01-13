@@ -77,7 +77,7 @@ def dfwide2ts_dls(df_wide, y, cfg, encoder=None):
         for feat_name, (start, end) in encoding_info['feature_ranges'].items()
     }
     ts_cat_dls.ts_cat_dims = ts_cat_dims
-    
+    ts_cat_dls.X_multi_hot = X_multi_hot
     return ts_cat_dls, encoding_info, encoder
 
 ### Default data prep to dls
@@ -242,8 +242,7 @@ def prepare_data_and_dls(cfg):
         test_ts_dls,
         test_tab_dls,
         test_ts_cat_dls,
-        bs=cfg["training"]["bs"],
-        shuffle_valid=False
+        bs=cfg["training"]["bs"]
     )
 
     # ============================================================================
@@ -254,8 +253,11 @@ def prepare_data_and_dls(cfg):
         "trainval": trainval,
         "holdout": holdout,
         "X": X,
-        "X_multi_hot": encoding_info.get('X_multi_hot'), 
+        "X_multi_hot": ts_cat_dls.X_multi_hot, 
         "y": y,
+        "tX": tX,
+        "tX_multi_hot":test_ts_cat_dls.X_multi_hot,
+        "ty":ty,
         "cat_cols": cat_cols,
         "num_cols": num_cols,
         "tfms": tfms,

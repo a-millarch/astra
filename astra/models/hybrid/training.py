@@ -1,46 +1,42 @@
-import torch
-from fastai.learner import Learner
+import os
+import numpy as np
 from tqdm.auto import tqdm
 
-
-import argparse
-import os
-import copy
-import warnings
 import torch
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import base64
-import io
-from scipy import stats
-import pickle
-
-from omegaconf import OmegaConf
+from fastai.learner import Learner
 
 from tsai.data.core import get_ts_dls
-from tsai.data.preprocessing import TSStandardize
 from tsai.data.tabular import get_tabular_dls
 from tsai.data.mixed import get_mixed_dls
 from tsai.data.validation import get_splits
-from tsai.data.preparation import df2xy
-from tsai.all import TSTabFusionTransformer, LabelSmoothingCrossEntropyFlat, Learner
+from tsai.all import LabelSmoothingCrossEntropyFlat, Learner
 
-#from fastai.callback.core import TrainEvalCallback, CancelValidException
-from fastai.data.transforms import Categorize
-from fastai.tabular.core import Categorify, FillMissing, Normalize
-from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve, precision_recall_curve
-
-from astra.utils import cfg, logger, get_base_df, align_dataframes, clear_mem, get_cfg
-from astra.data.datasets import TSDS
+from astra.utils import cfg, logger, clear_mem
 from astra.models.hybrid.mlm import TSTabFusionMLM, MLMConfig, pretrain_mlm_enhanced
 
-#from astra.visualize.evaluation import plot_evaluation, plot_multiple_evaluations, plot_time_metrics
-
-from astra.evaluation.hybrid_model import run_eval
 from astra.models.callbacks import SkipValidationCallback
+from astra.models.hybrid.model import TSTabFusionTransformerMultiHot
+from astra.data.dataloader import dfwide2ts_dls
 
+def get_backbone(data, cfg): #TODO: use cfg model parameters
+    backbone = TSTabFusionTransformerMultiHot(
+    c_in=data["ts_dls"].vars,
+    c_out=2,
+    seq_len=data["mixed_dls"].len,
+    classes= data["classes"],
+    cont_names=data["num_cols"],
+    ts_cat_dims=data["ts_cat_dls"].ts_cat_dims,
+    d_model=64,
+    n_layers=8,
+    n_heads=8,
+    fc_dropout=0.75,
+    res_dropout=0.22,
+    fc_mults=(0.3, 0.1),
 
+    cat_ts_combine='add',
+    use_count_normalization=False
+    )
+    return backbone
 
 def run_pretrain(data, pretrain_cfg=None, device='cuda'):
     """
@@ -86,26 +82,20 @@ def run_pretrain(data, pretrain_cfg=None, device='cuda'):
         bs=cfg["training"]["bs"],
         drop_last=False
     )
+    ts_cat_dls_ul, encoding_info, cat_encoder = dfwide2ts_dls(
+        data["trainval"].complete_cat, 
+        cfg,
+        encoder=None  # Fit new encoder
+    )
 
     mixed_dls_ul = get_mixed_dls(
         ts_dls_ul,
         tab_dls_ul,
+        ts_cat_dls_ul,
         bs=cfg["training"]["bs"]
     )
 
-    backbone = TSTabFusionTransformer(
-        c_in=mixed_dls_ul.vars,
-        c_out=2,
-        seq_len=mixed_dls_ul.len,
-        classes=classes,
-        cont_names=num_cols,
-        n_layers=8,
-        n_heads=8,
-        d_model=64,
-        fc_dropout=0.75,
-        res_dropout=0.22,
-        fc_mults=(0.3, 0.1),
-    )
+    backbone = get_backbone(data, cfg)  
 
     if pretrain_cfg is None:
         pretrain_cfg = MLMConfig(
@@ -155,21 +145,8 @@ def run_finetune(
     num_cols = data["num_cols"]
     classes = data["classes"]
 
-    # Build backbone
-    backbone = TSTabFusionTransformer(
-        c_in=mixed_dls.vars,
-        c_out=2,
-        seq_len=mixed_dls.len,
-        classes=classes,
-        cont_names=num_cols,
-        n_layers=8,
-        n_heads=8,
-        d_model=64,
-        fc_dropout=0.75,
-        res_dropout=0.22,
-        fc_mults=(0.3, 0.1),
-    )
-
+    backbone = get_backbone(data, cfg)
+    
     if use_pretrained:
         if pretrain_cfg is None:
             checkpoint_dir = './pretrain_checkpoints'

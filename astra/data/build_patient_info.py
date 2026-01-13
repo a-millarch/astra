@@ -9,6 +9,7 @@ from astra.data.mapper import map_concept
 
 from typing import List, Dict, Optional, Union
 
+
 from azureml.core import Dataset
 
 def create_base_df(cfg, result_path = "data/interim/base_df.pkl"):
