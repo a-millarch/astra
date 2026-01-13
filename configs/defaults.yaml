@@ -32,6 +32,12 @@ dataset:
   age_max: 90
 
   id_col: PID
+  ts_cat_names:
+      - Medicin
+      - Procedurer
+  ts_categorical_multi_label:
+      - Medicin
+      - Procedurer
   cat_cols:
       - SEX
       - FIRST_HOSPITAL
