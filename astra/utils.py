@@ -434,8 +434,9 @@ def list_from_col(df, col_name, target_col="col_cat", return_col="TQIP_name"):
     return df[df[target_col] == col_name][return_col].tolist()
 
 
+
 def get_concept(concept, cfg) -> dict:
-    """get numerical concept from name"""
+    """get concept from name"""
 
     drop_cols = cfg["drop_features"][concept]
     concept_dict = {}
