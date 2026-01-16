@@ -5,54 +5,81 @@ from astra.evaluation.hybrid_model import run_eval
 
 from astra.data.dataloader import prepare_data_and_dls, save_normalization_artifacts
 from astra.models.hybrid.training import run_pretrain, run_finetune, run_finetune_early_prediction_optimized
+from astra.models.hybrid.mlm import MLMConfig
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description='MLM Pretraining + Fine-tuning Pipeline')
+      
     
-    parser.add_argument('--model-name', '-m', default='13012025', help='Model name')
-    parser.add_argument('--lr', type=float, default=4.7863e-4, help='Learning rate')
-    parser.add_argument('--finetune-epochs', type=int, default=22, help='Fine-tune epochs')
+    # 1. Pipeline Stages (Defaults: Only Finetune and Eval are on)
+    parser.add_argument('--pretrain', action='store_true', default=False)
+    parser.add_argument('--finetune', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--eval', action=argparse.BooleanOptionalAction, default=True)
     
-    # Stage flags
-    parser.add_argument('--pretrain', action='store_true', default=True)
-    parser.add_argument('--no-pretrain', dest='pretrain', action='store_false')
-    parser.add_argument('--finetune', action='store_true', default=True)
-    parser.add_argument('--no-finetune', dest='finetune', action='store_false')
-    parser.add_argument('--eval', action='store_true', default=True)
-    parser.add_argument('--no-eval', dest='eval', action='store_false')
+    # 2. Logic Flags (Default: Load pretrained model if finetuning)
+    parser.add_argument('--use-pretrained', action=argparse.BooleanOptionalAction, default=True,
+                       help='Load pretrained weights before finetuning')
+    parser.add_argument('--alternative-fine-tune', action='store_true', default=False)
+    parser.add_argument('--skip-valid',  action=argparse.BooleanOptionalAction, default=True)
     
-    # New eval flag
-    parser.add_argument('--comprehensive-eval', action='store_true', default=False,
-                       help='Run full time-dependent evaluation (default)')
-    parser.add_argument('--multicurve', action='store_true', default=True,
-                       help='Run full time-dependent evaluation (default)')
-    parser.add_argument('--simple-eval', dest='comprehensive_eval', action='store_false',
-                       help='Run simple single-point evaluation')
-    
-    parser.add_argument('--use-pretrained', action='store_true', default=True)
-    parser.add_argument('--skip-valid', action='store_true', default=True)
-    parser.add_argument('--device', default='cuda')
+    # 3. Eval Flags (Default: Comprehensive is OFF, Multicurve is OFF)
+    parser.add_argument('--comprehensive-eval', action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument('--multicurve', action='store_true', default=False)
     
     return parser.parse_args()
 
 def main():
     args = parse_args()
     data = prepare_data_and_dls(cfg)
-    pretrain_cfg = None
+    pretrain_cfg = MLMConfig(
+            mask_prob_ts=0.10,
+            mask_prob_cat_ts=0.10,
+            mask_prob_cat=0.15,
+            mask_prob_cont=0.15,
+            epochs=50,
+            lr=1e-5,
+            warmup_epochs=3,
+            ts_loss_weight=1.0,
+            cat_loss_weight=1.0,
+            cont_loss_weight=1.0,
+            contrastive_weight=1.0,
+            patience=5,
+            save_best=True,
+            checkpoint_dir='./pretrain_checkpoints'
+        )
     
     if args.pretrain:
         logger.info("=== Running Pretraining ===")
-        pretrain_cfg, _, _ = run_pretrain(data, device=args.device)
+        pretrain_cfg, _, _ = run_pretrain(data, pretrain_cfg = pretrain_cfg, device='cuda')
     
     if args.finetune:
         logger.info("=== Running Fine-tuning ===")
-        run_finetune(data, args.model_name, args.use_pretrained, pretrain_cfg,
+        
+        if args.alternative_fine_tune:
+            logger.info(">> Alternative method")
+            learn = run_finetune_early_prediction_optimized(
+                                                data,
+                                                model_name=cfg["model_name"],
+                                                use_pretrained=args.use_pretrained,
+                                                pretrain_cfg=pretrain_cfg,
+                                                lr=4.7863e-4,
+                                                n_epochs=22,
+                                                # New parameters:
+                                                enable_time_masking=True,      # ← Progressive masking
+                                                enable_sample_weighting=True,  # ← Weight samples by data
+                                                masking_prob=0.5,              # ← 50% of batches get masked
+                                                early_weight=2.0,              # ← 2x penalty for early errors
+                                                min_timesteps=2                # ← Keep at least 1 hour
+                                                )        
+        else: 
+            run_finetune(data, cfg["model_name"], args.use_pretrained, pretrain_cfg,
                     args.skip_valid, args.lr, args.finetune_epochs)
     
+
     if args.eval:
         logger.info("=== Running Evaluation ===")
-        results, preds_df = run_eval(data, args.model_name, args.multicurve,args.comprehensive_eval)
+        results, preds_df = run_eval(data, cfg["model_name"], args.multicurve,args.comprehensive_eval)
         if args.comprehensive_eval:
             logger.info(f"Generated {len(results[0])} time points with CIs")
 
