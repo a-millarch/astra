@@ -1,6 +1,12 @@
+import torch.nn.functional as F
+import torch
+import torch.nn as nn
+
 from tsai.all import TensorMultiCategory, Categorize, BCEWithLogitsLossFlat
 from fastai.callback.all import *
 from fastcore.foundation import L
+from fastai.losses import BaseLoss
+
 from matplotlib import pyplot as plt
 from fastai.callback.core import Callback
 from fastcore.basics import store_attr, range_of
@@ -182,3 +188,146 @@ class TrainingShowGraph(Callback):
             self.graph_ax.set_ylim(*y_bounds)
         self.graph_ax.set_title(f"Losses\nepoch: {self.epoch +1}/{self.n_epoch}")
         self.graph_out.update(self.graph_ax.figure)
+
+
+class ProgressiveTimeMaskingCallback(Callback):
+    """
+    FastAI Callback: Randomly truncates time series during training.
+    
+    Forces model to learn predictions with incomplete data.
+    """
+    
+    def __init__(self, min_timesteps=6, max_timesteps=114, prob=0.5):
+        """
+        Args:
+            min_timesteps: Minimum timesteps to keep (e.g., 6 = 1 hour)
+            max_timesteps: Maximum timesteps (full sequence)
+            prob: Probability of applying masking (0.5 = 50% of batches)
+        """
+        self.min_timesteps = min_timesteps
+        self.max_timesteps = max_timesteps
+        self.prob = prob
+    
+    def before_batch(self):
+        """Called before each training batch."""
+        # Only apply during training
+        if not self.training:
+            return
+        
+        # Apply masking with probability
+        if torch.rand(1).item() > self.prob:
+            return
+        
+        # Get batch inputs
+        if isinstance(self.xb[0], (tuple, list)):
+            # Mixed inputs: (x_ts, x_tab, x_ts_cat)
+            x_ts, x_tab, x_ts_cat = self.xb[0]
+            
+            # Apply masking to continuous TS only
+            x_ts_masked = self._apply_mask(x_ts)
+            
+            # Update batch
+            self.learn.xb = ((x_ts_masked, x_tab, x_ts_cat),)
+        else:
+            # Single input (shouldn't happen with mixed_dls, but handle it)
+            self.learn.xb = (self._apply_mask(self.xb[0]),)
+    
+    def _apply_mask(self, x_ts):
+        """Apply progressive time masking to time series."""
+        batch_size, seq_len, n_features = x_ts.shape
+        
+        # Random cutoff for each sample in batch
+        cutoffs = torch.randint(
+            self.min_timesteps,
+            min(seq_len, self.max_timesteps) + 1,
+            (batch_size,),
+            device=x_ts.device
+        )
+        
+        # Create mask: keep timesteps before cutoff
+        timestep_indices = torch.arange(seq_len, device=x_ts.device).expand(batch_size, -1)
+        mask = (timestep_indices < cutoffs.unsqueeze(1)).unsqueeze(-1)  # [batch, seq, 1]
+        
+        # Apply mask (zero out future timesteps)
+        return x_ts * mask.float()
+
+
+
+class ProgressiveTimeMaskingCallback(Callback):
+    """Randomly truncates time series during training."""
+    
+    def __init__(self, min_timesteps=6, max_timesteps=114, prob=0.5):
+        self.min_timesteps = min_timesteps
+        self.max_timesteps = max_timesteps
+        self.prob = prob
+    
+    def before_batch(self):
+        if not self.training or torch.rand(1).item() > self.prob:
+            return
+        
+        # Get inputs
+        inputs = self.xb[0]
+        if isinstance(inputs, (tuple, list)):
+            x_ts, x_tab, x_ts_cat = inputs
+            x_ts_masked = self._apply_mask(x_ts)
+            self.learn.xb = ((x_ts_masked, x_tab, x_ts_cat),)
+    
+    def _apply_mask(self, x_ts):
+        batch_size, seq_len, n_features = x_ts.shape
+        cutoffs = torch.randint(
+            self.min_timesteps,
+            min(seq_len, self.max_timesteps) + 1,
+            (batch_size,),
+            device=x_ts.device
+        )
+        mask = (torch.arange(seq_len, device=x_ts.device).expand(batch_size, -1) 
+                < cutoffs.unsqueeze(1)).unsqueeze(-1)
+        return x_ts * mask.float()
+
+class WeightedLossCallback(Callback):
+    """
+    Alternative approach: Manually compute weighted loss.
+    
+    This bypasses the automatic loss computation and applies weights directly.
+    """
+    
+    def __init__(self, base_loss_func, early_weight=2.0):
+        self.base_loss_func = base_loss_func
+        self.early_weight = early_weight
+        self.enabled = True
+    
+    def before_batch(self):
+        """Store inputs for weight computation."""
+        if not self.training or not self.enabled:
+            return
+        
+        inputs = self.xb[0]
+        if isinstance(inputs, (tuple, list)):
+            self.x_ts = inputs[0]
+        else:
+            self.x_ts = inputs
+    
+    def after_pred(self):
+        """Compute weighted loss manually."""
+        if not self.training or not self.enabled:
+            return
+        
+        # Get predictions and targets
+        pred = self.learn.pred
+        targ = self.yb[0]
+        
+        # Compute per-sample loss
+        loss_per_sample = F.cross_entropy(pred, targ, reduction='none')
+        
+        # Compute weights
+        data_availability = (self.x_ts.abs().sum(dim=-1) > 1e-6).float().sum(dim=1)
+        max_steps = self.x_ts.shape[1]
+        availability_ratio = data_availability / max_steps
+        weights = self.early_weight - (self.early_weight - 1.0) * availability_ratio
+        
+        # Apply weights
+        weighted_loss = (loss_per_sample * weights).mean()
+        
+        # Override the loss
+        self.learn.loss_grad = weighted_loss
+        self.learn.loss = weighted_loss.detach()

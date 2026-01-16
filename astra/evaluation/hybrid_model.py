@@ -11,12 +11,13 @@ from tsai.data.tabular import get_tabular_dls
 from tsai.data.mixed import get_mixed_dls
 from tsai.data.preparation import df2xy
 
-from astra.utils import cfg, logger, save_figure
+from astra.utils import cfg, logger
+from astra.evaluation.utils import save_figure
 from astra.data.dataloader import dfwide2ts_dls
 from astra.evaluation.utils import calculate_roc_auc_ci, calculate_average_precision_ci
 from sklearn.metrics import roc_curve, roc_auc_score, precision_recall_curve, average_precision_score
 from astra.models.hybrid.training import get_backbone, Learner, patch_learner_get_preds
-from astra.visualize import plot_evaluation
+from astra.visualize.evaluation import plot_evaluation
 
 
 @dataclass
@@ -60,7 +61,7 @@ class TimeDependentEvaluator:
         
         # Cache static components
         self.tfms = data["tfms"]
-        self.batch_tfms = data["batch_tfms"]
+        self.batch_tfms = data.get("batch_tfms", None)  # May be None with fixed norm
         self.procs = data["procs"]
         self.cat_cols = data["cat_cols"]
         self.num_cols = data["num_cols"]
@@ -68,6 +69,10 @@ class TimeDependentEvaluator:
         self.cat_encoder = data["cat_encoder"]
         self.target = cfg["target"]
         self.bs = cfg["training"]["bs"]
+        
+        # Cache normalization scalers (for fixed normalization)
+        self.ts_scaler = data.get("ts_scaler", None)
+        self.tab_scaler = data.get("tab_scaler", None)
         
     def fill_zero(self, df: pd.DataFrame, censor_step: int, is_categorical: bool = False) -> pd.DataFrame:
         """
@@ -114,6 +119,8 @@ class TimeDependentEvaluator:
         """
         Create mixed dataloaders with data censored at specified time step.
         
+        UPDATED: Now applies fixed normalization if scalers are available.
+        
         Args:
             tsds: Time series dataset object (holdout)
             censor_step: Time step to censor at
@@ -145,20 +152,40 @@ class TimeDependentEvaluator:
             logger.warning(f"Skipping censor_step={censor_step}: only one class present")
             return None
         
+        # ========================================================================
+        # APPLY FIXED NORMALIZATION (if scalers available)
+        # ========================================================================
+        if self.ts_scaler is not None:
+            # Normalize continuous TS with FITTED scaler
+            tX_shape = tX.shape
+            tX_reshaped = tX.reshape(-1, tX_shape[2])
+            tX = self.ts_scaler.transform(tX_reshaped).reshape(tX_shape)
+        
+        # Normalize tabular data with FITTED scaler
+        if self.tab_scaler is not None and self.num_cols:
+            tab_df_normalized = tsds.tab_df.copy()
+            tab_df_normalized[self.num_cols] = self.tab_scaler.transform(tsds.tab_df[self.num_cols])
+        else:
+            tab_df_normalized = tsds.tab_df
+        
+        # ========================================================================
+        # CREATE DATALOADERS (no batch transforms with fixed normalization)
+        # ========================================================================
+        
         # Create continuous TS dataloaders
         test_ts_dls = get_ts_dls(
             tX, ty,
             splits=None,
             tfms=self.tfms,
-            batch_tfms=self.batch_tfms,
+            batch_tfms=self.batch_tfms,  # None if using fixed normalization
             bs=self.bs,
             drop_last=False,
             shuffle=False
         )
         
-        # Create tabular dataloaders (static features - no censoring needed)
+        # Create tabular dataloaders (with normalized data)
         test_tab_dls = get_tabular_dls(
-            tsds.tab_df,
+            tab_df_normalized,
             procs=self.procs,
             cat_names=self.cat_cols.copy(),
             cont_names=self.num_cols.copy(),
@@ -578,6 +605,8 @@ class TimeDependentEvaluator:
         return results, None
 
 
+
+
 # ============================================================================
 # HELPER FUNCTIONS FOR TIME CONVERSION
 # ============================================================================
@@ -871,7 +900,7 @@ def plot_multiple_roc_pr_curves(
     
 #### evaluation function
 
-def run_eval(data, model_name: str, comprehensive_eval: bool = True):
+def run_eval(data, model_name: str, multicurve:bool = True, comprehensive_eval: bool = True):
     """
     Enhanced evaluation with time-dependent metrics using new evaluator.
     
@@ -886,7 +915,7 @@ def run_eval(data, model_name: str, comprehensive_eval: bool = True):
     """
     mixed_dls = data["mixed_dls"]
     holdout = data["holdout"]
-    
+    holdout_mixed_dls = data["holdout_mixed_dls"]
     # ============================================================================
     # LOAD MODEL
     # ============================================================================
@@ -905,17 +934,51 @@ def run_eval(data, model_name: str, comprehensive_eval: bool = True):
     # BASELINE EVALUATION (Full Time Series)
     # ============================================================================
     logger.info("Running baseline evaluation with full time series...")
-    holdout_mixed_dls = data["holdout_mixed_dls"]
-    preds, targs = learn.get_preds(dl=holdout_mixed_dls.train)
     
+    
+    preds, targs = learn.get_preds(dl=holdout_mixed_dls.train)
+
     # Plot and save baseline evaluation
     evalplt = plot_evaluation(preds[:, 1], targs, cfg["target"])
-    save_figure(evalplt, f"baseline_eval_{model_name}", save_dir='reports/studyfigs')
+    save_figure(evalplt, f"baseline_eval_{model_name}", save_dir='reports/')
     logger.info("✓ Baseline ROC/PR plot saved")
     
     # ============================================================================
     # COMPREHENSIVE TIME-DEPENDENT EVALUATION
     # ============================================================================
+    if multicurve:
+        logger.info("Creating multiple ROC/PR curves...")
+        # Select key time points for visualization
+        key_timepoints = [
+            time_to_step(1, 'h'),
+            time_to_step(6, 'h'),
+            time_to_step(12, 'h'),
+            time_to_step(24, 'h'),
+            time_to_step(72, 'h'),
+            time_to_step(7, 'D'),
+            time_to_step(14, 'D'),
+            time_to_step(30, 'D')
+        ]
+        
+        # Filter out None values and reverse for better legend ordering
+        key_timepoints = [t for t in key_timepoints if t is not None]
+        key_timepoints.reverse()
+        
+        # Generate labels
+        labels = [format_step_label(step) for step in key_timepoints]
+        evaluator = TimeDependentEvaluator(data, learn, cfg)
+        
+        # Create plot
+        fig_curves = plot_multiple_roc_pr_curves(
+            evaluator,
+            holdout,
+            key_timepoints,
+            labels=labels
+        )
+        save_figure(fig_curves, f"multi_curves_{model_name}", save_dir='reports/')
+        logger.info("✓ Multiple curves plot saved")
+        
+    
     if comprehensive_eval:
         logger.info("="*80)
         logger.info("STARTING COMPREHENSIVE TIME-DEPENDENT EVALUATION")
@@ -954,43 +1017,13 @@ def run_eval(data, model_name: str, comprehensive_eval: bool = True):
         # ========================================================================
         logger.info("Creating time-dependent metrics plot...")
         fig_time = plot_time_metrics(results, cut_hours=72, max_days=30)
-        save_figure(fig_time, f"time_metrics_{model_name}", save_dir='reports/studyfigs')
+        save_figure(fig_time, f"time_metrics_{model_name}", save_dir='reports/')
         logger.info("✓ Time metrics plot saved")
         
         # ========================================================================
         # PLOT 2: Multiple ROC/PR curves at key time points
         # ========================================================================
-        logger.info("Creating multiple ROC/PR curves...")
-        
-        # Select key time points for visualization
-        key_timepoints = [
-            time_to_step(1, 'h'),
-            time_to_step(6, 'h'),
-            time_to_step(12, 'h'),
-            time_to_step(24, 'h'),
-            time_to_step(72, 'h'),
-            time_to_step(7, 'D'),
-            time_to_step(14, 'D'),
-            time_to_step(30, 'D')
-        ]
-        
-        # Filter out None values and reverse for better legend ordering
-        key_timepoints = [t for t in key_timepoints if t is not None]
-        key_timepoints.reverse()
-        
-        # Generate labels
-        labels = [format_step_label(step) for step in key_timepoints]
-        
-        # Create plot
-        fig_curves = plot_multiple_roc_pr_curves(
-            evaluator,
-            holdout,
-            key_timepoints,
-            labels=labels
-        )
-        save_figure(fig_curves, f"multi_curves_{model_name}", save_dir='reports/studyfigs')
-        logger.info("✓ Multiple curves plot saved")
-        
+      
         # ========================================================================
         # SUMMARY STATISTICS
         # ========================================================================

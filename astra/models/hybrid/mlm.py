@@ -9,12 +9,17 @@ from dataclasses import dataclass, asdict
 from collections import defaultdict
 from tqdm.auto import tqdm
 
+from astra.utils import logger
 # ============================================================================
 # Configuration Management
 # ============================================================================
 
+# ============================================================================
+# Enhanced MLM Model with Contrastive Learning
+# ============================================================================
+
 @dataclass
-class MLMConfig: #TODO: inherit from cfg
+class MLMConfig:
     """Configuration for MLM pre-training with multi-hot categorical TS"""
     # Masking strategy
     mask_prob_ts: float = 0.15       # Continuous time series
@@ -50,9 +55,6 @@ class MLMConfig: #TODO: inherit from cfg
     min_delta: float = 1e-4
     val_frequency: int = 1
 
-# ============================================================================
-# Enhanced MLM Model with Contrastive Learning
-# ============================================================================
 
 class TSTabFusionMLM(nn.Module):
     """
@@ -721,17 +723,17 @@ def pretrain_mlm_enhanced(
                     'val_loss': val_loss,
                     'config': config
                 }, checkpoint_dir / 'best_model.pt')
-                print(f"  ✓ Saved best model (val_loss: {val_loss:.4f})")
+                logger.info(f"  ✓ Saved best model (val_loss: {val_loss:.4f})")
             
             # Early stopping
             if early_stopping(val_loss):
-                print(f"\nEarly stopping triggered at epoch {epoch+1}")
+                logger.info(f"\nEarly stopping triggered at epoch {epoch+1}")
                 break
         
         # Print epoch summary
-        print(f"Epoch {epoch+1}/{config.epochs} - Train Loss: {avg_train_loss:.4f}")
+        logger.info(f"Epoch {epoch+1}/{config.epochs} - Train Loss: {avg_train_loss:.4f}")
         if val_loss is not None:
-            print(f"  Val Loss: {val_loss:.4f}")
+            logger.info(f"  Val Loss: {val_loss:.4f}")
     
     # Plot training curves
     plot_training_curves(history, save_path=checkpoint_dir / 'training_curves.png')

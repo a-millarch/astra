@@ -14,9 +14,9 @@ from tsai.all import LabelSmoothingCrossEntropyFlat, Learner
 from astra.utils import cfg, logger, clear_mem
 from astra.models.hybrid.mlm import TSTabFusionMLM, MLMConfig, pretrain_mlm_enhanced
 
-from astra.models.callbacks import SkipValidationCallback
+from astra.models.callbacks import SkipValidationCallback, ProgressiveTimeMaskingCallback, WeightedLossCallback
 from astra.models.hybrid.model import TSTabFusionTransformerMultiHot
-from astra.data.dataloader import dfwide2ts_dls
+from astra.data.dataloader import dfwide2ts_dls, tscatdfwide2x
 
 def get_backbone(data, cfg): #TODO: use cfg model parameters
     backbone = TSTabFusionTransformerMultiHot(
@@ -40,17 +40,94 @@ def get_backbone(data, cfg): #TODO: use cfg model parameters
 
 def run_pretrain(data, pretrain_cfg=None, device='cuda'):
     """
-    data: dict returned by prepare_data_and_dls()
-    pretrain_cfg: MLMConfig or None (then a default is used)
+    Run pretraining with NORMALIZED continuous features.
+    
+    Args:
+        data: dict returned by prepare_data_and_dls() with fixed normalization
+        pretrain_cfg: MLMConfig or None (then a default is used)
+        device: 'cuda' or 'cpu'
+    
+    Returns:
+        pretrain_cfg, mlm_model, mixed_dls_ul
     """
-    X, y = data["X"], data["y"]
+    if pretrain_cfg is None: #TODO: use regular config
+        pretrain_cfg = MLMConfig(
+            mask_prob_ts=0.10,
+            mask_prob_cat_ts=0.10,
+            mask_prob_cat=0.15,
+            mask_prob_cont=0.15,
+            epochs=50,
+            lr=1e-5,
+            warmup_epochs=3,
+            ts_loss_weight=1.0,
+            cat_loss_weight=1.0,
+            cont_loss_weight=1.0,
+            contrastive_weight=1.0,
+            patience=5,
+            save_best=True,
+            checkpoint_dir='./pretrain_checkpoints'
+        )
+
+    # ============================================================================
+    # EXTRACT NORMALIZED DATA (already normalized in prepare_data_and_dls)
+    # ============================================================================
+    X = data["X"]  # ← Already normalized!
+    y = data["y"]
     num_cols = data["num_cols"]
+    cat_cols = data["cat_cols"]
     classes = data["classes"]
     tfms = data["tfms"]
-    batch_tfms = data["batch_tfms"]
-    procs = data["procs"]
-
-    # Create splits for unlabeled pretraining (train/valid on same X,y)
+    batch_tfms = data.get("batch_tfms", None)  # Should be None with fixed normalization
+    procs = data["procs"]  # Should NOT include Normalize
+    
+    # ============================================================================
+    # VALIDATE NORMALIZATION
+    # ============================================================================
+    logger.info("Validating data normalization for pretraining...")
+    logger.info(f"  X mean: {X.mean():.4f}, std: {X.std():.4f}")
+    
+    if abs(X.mean()) > 1.0 or not (0.5 < X.std() < 2.0):
+        logger.warning(f"⚠️  X normalization looks suspicious! mean={X.mean():.4f}, std={X.std():.4f}")
+        logger.warning("    Expected: mean ≈ 0, std ≈ 1")
+    else:
+        logger.info("  ✓ Time series normalization looks good")
+    
+    # ============================================================================
+    # CREATE NORMALIZED TABULAR DATAFRAME
+    # ============================================================================
+    # The raw trainval.tab_df is NOT normalized
+    # We need to apply the tab_scaler to get normalized version
+    
+    tab_scaler = data.get("tab_scaler", None)
+    
+    if tab_scaler is not None and num_cols:
+        logger.info("Creating normalized tabular DataFrame for pretraining...")
+        
+        # Create normalized copy
+        trainval_tab_normalized = data["trainval"].tab_df.copy()
+        trainval_tab_normalized[num_cols] = tab_scaler.transform(
+            data["trainval"].tab_df[num_cols]
+        )
+        
+        # Validate
+        tab_mean = trainval_tab_normalized[num_cols].mean().mean()
+        tab_std = trainval_tab_normalized[num_cols].std().mean()
+        logger.info(f"  Tabular mean: {tab_mean:.4f}, std: {tab_std:.4f}")
+        
+        if abs(tab_mean) > 1.0 or not (0.5 < tab_std < 2.0):
+            logger.warning(f"⚠️  Tabular normalization looks suspicious!")
+        else:
+            logger.info("  ✓ Tabular normalization looks good")
+    else:
+        # No scaler (shouldn't happen with new code) or no continuous cols
+        logger.warning("No tab_scaler found in data dict - using raw tabular data")
+        trainval_tab_normalized = data["trainval"].tab_df
+    
+    # ============================================================================
+    # CREATE TRAIN/VALID SPLITS FOR PRETRAINING
+    # ============================================================================
+    logger.info("Creating train/valid splits for unsupervised pretraining...")
+    
     ts_splits = get_splits(
         y,
         valid_size=0.2,
@@ -60,49 +137,94 @@ def run_pretrain(data, pretrain_cfg=None, device='cuda'):
         check_splits=True,
         show_plot=True
     )
-
     splits = (ts_splits[0], ts_splits[1])
-    #splits = ((ts_splits[0],)+ (ts_splits[1],))
     
+    logger.info(f"  Train samples: {len(splits[0])}")
+    logger.info(f"  Valid samples: {len(splits[1])}")
+    
+    # ============================================================================
+    # CREATE UNLABELED DATALOADERS (no targets needed for pretraining)
+    # ============================================================================
+    logger.info("Creating unlabeled dataloaders for pretraining...")
+    
+    # 1. Continuous time series (already normalized)
     ts_dls_ul = get_ts_dls(
-        X,
+        X,  # ← Already normalized
         splits=splits,
         tfms=tfms,
-        batch_tfms=batch_tfms,
+        batch_tfms=None,  # ← NO batch transforms! Already normalized
         bs=cfg["training"]["bs"],
         drop_last=False
     )
-
+    logger.info("  ✓ Created continuous TS dataloader")
+    
+    # 2. Tabular features (now normalized!)
     tab_dls_ul = get_tabular_dls(
-        data["trainval"].tab_df,
-        procs=procs,
-        cat_names=data["cat_cols"].copy(),
+        trainval_tab_normalized,  # ← NOW NORMALIZED!
+        procs=procs,  # Should NOT include Normalize
+        cat_names=cat_cols.copy(),
         cont_names=num_cols.copy(),
         splits=splits,
         bs=cfg["training"]["bs"],
         drop_last=False
     )
-    ts_cat_dls_ul, encoding_info, cat_encoder = dfwide2ts_dls(
-        data["trainval"].complete_cat, 
-        cfg,
-        encoder=None  # Fit new encoder
+    logger.info("  ✓ Created tabular dataloader")
+    
+    # 3. Categorical time series (no normalization needed)
+    ts_cat_dls_ul = get_ts_dls(
+        data["ts_cat_dls"].X_multi_hot.astype(np.int64),
+        splits=splits,
+        bs=cfg["training"]["bs"],
+        drop_last=False
     )
-
+    logger.info("  ✓ Created categorical TS dataloader")
+    
+    # 4. Combine into mixed dataloader
     mixed_dls_ul = get_mixed_dls(
         ts_dls_ul,
         tab_dls_ul,
         ts_cat_dls_ul,
         bs=cfg["training"]["bs"]
     )
-
-    backbone = get_backbone(data, cfg)  
-
+    logger.info("  ✓ Created mixed dataloader")
+    
+    # ============================================================================
+    # VALIDATE DATALOADER OUTPUTS
+    # ============================================================================
+    logger.info("Validating dataloader batch...")
+    
+    for batch in mixed_dls_ul.train:
+        inputs, targets = batch
+        
+        # Check continuous TS
+        if isinstance(inputs, (tuple, list)):
+            ts_batch = inputs[0]
+            # Convert to float for formatting
+            ts_mean = float(ts_batch.mean())
+            ts_std = float(ts_batch.std())
+            logger.info(f"  TS batch mean: {ts_mean:.4f}, std: {ts_std:.4f}")
+            
+            if abs(ts_mean) > 2.0:
+                logger.warning("  ⚠️  TS batch not normalized!")
+        
+        break  # Just check first batch
+    
+    # ============================================================================
+    # CREATE BACKBONE AND MLM MODEL
+    # ============================================================================
+    logger.info("Creating backbone and MLM model...")
+    
+    backbone = get_backbone(data, cfg)
+    logger.info(f"  Backbone: {type(backbone).__name__}")
+    
+    # Default pretraining config
     if pretrain_cfg is None:
         pretrain_cfg = MLMConfig(
             mask_prob_ts=0.10,
+            mask_prob_cat_ts=0.10,
             mask_prob_cat=0.15,
             mask_prob_cont=0.15,
-            epochs=50,
+            epochs=500,
             lr=1e-5,
             warmup_epochs=3,
             ts_loss_weight=1.0,
@@ -113,9 +235,22 @@ def run_pretrain(data, pretrain_cfg=None, device='cuda'):
             save_best=True,
             checkpoint_dir='./pretrain_checkpoints'
         )
-
+    
     mlm_model = TSTabFusionMLM(backbone, pretrain_cfg)
-
+    logger.info(f"  MLM model created")
+    
+    # ============================================================================
+    # RUN PRETRAINING
+    # ============================================================================
+    logger.info("="*80)
+    logger.info("STARTING PRETRAINING")
+    logger.info("="*80)
+    logger.info(f"  Epochs: {pretrain_cfg.epochs}")
+    logger.info(f"  Learning rate: {pretrain_cfg.lr}")
+    logger.info(f"  Batch size: {cfg['training']['bs']}")
+    logger.info(f"  Device: {device}")
+    logger.info("="*80)
+    
     history = pretrain_mlm_enhanced(
         mlm_model,
         train_loader=mixed_dls_ul.train,
@@ -123,9 +258,24 @@ def run_pretrain(data, pretrain_cfg=None, device='cuda'):
         config=pretrain_cfg,
         device=device
     )
-
+    
+    logger.info("="*80)
+    logger.info("PRETRAINING COMPLETE")
+    logger.info("="*80)
     logger.info('Pretrained model saved')
+    
+    # Expected loss ranges with normalized data:
+    logger.info("\n📊 Expected loss ranges (with normalization):")
+    logger.info("  Total loss: 5-50 (not 1000s!)")
+    logger.info("  TS loss: 0.5-5")
+    logger.info("  Cat TS loss: 0.3-2")
+    logger.info("  Cat loss: 0.5-3")
+    logger.info("  Cont loss: 0.5-10 (not 9000!)")
+    logger.info("  Contrastive: 1-10")
+    
     return pretrain_cfg, mlm_model, mixed_dls_ul
+
+
 
 
 def run_finetune(
@@ -157,6 +307,7 @@ def run_finetune(
         mlm_model = TSTabFusionMLM(backbone, pretrain_cfg)
         mlm_model.load_state_dict(checkpoint['model_state_dict'])
         backbone = mlm_model.backbone
+        logger.info("Pretrained model loaded")
 
     loss_func = LabelSmoothingCrossEntropyFlat()
     cbs = [SkipValidationCallback()] if skip_valid else None
@@ -168,7 +319,7 @@ def run_finetune(
         metrics=None,
         cbs=cbs
     )
-
+    
     learn.fit_one_cycle(n_epochs, lr)
     learn.save(model_name)
     clear_mem()
@@ -436,3 +587,103 @@ def create_learner_with_working_get_preds(dls, model, loss_func=None, opt_func=N
     
     return learn
 
+
+def run_finetune_early_prediction_optimized(
+    data,
+    model_name: str,
+    use_pretrained: bool = True,
+    pretrain_cfg = None,
+    skip_valid: bool = True,
+    lr: float = 4.7863e-4,
+    n_epochs: int = 22,
+    # Early prediction parameters
+    enable_time_masking: bool = True,
+    enable_sample_weighting: bool = True,
+    masking_prob: float = 0.5,
+    early_weight: float = 2.0,
+    min_timesteps: int = 6
+):
+    """
+    Fine-tune classifier with early prediction optimization.
+    
+    Args:
+        enable_time_masking: Apply progressive masking during training
+        enable_sample_weighting: Weight loss by data availability
+        masking_prob: Fraction of batches to mask (0.5 = 50%)
+        early_weight: Max weight for early samples (1.5-3.0)
+        min_timesteps: Minimum timesteps to keep when masking
+    """
+    from astra.models.hybrid.training import get_backbone, SkipValidationCallback
+    from astra.models.hybrid.mlm import TSTabFusionMLM
+    from astra.utils import logger, cfg, clear_mem
+    import os
+    
+    mixed_dls = data["mixed_dls"]
+    backbone = get_backbone(data, cfg)
+    
+    # Load pretrained weights
+    if use_pretrained:
+        checkpoint_dir = pretrain_cfg.checkpoint_dir if pretrain_cfg else './pretrain_checkpoints'
+        checkpoint_path = os.path.join(checkpoint_dir, 'best_model.pt')
+        
+        if os.path.exists(checkpoint_path):
+            checkpoint = torch.load(checkpoint_path)
+            mlm_model = TSTabFusionMLM(backbone, pretrain_cfg)
+            mlm_model.load_state_dict(checkpoint['model_state_dict'])
+            backbone = mlm_model.backbone
+            logger.info("✓ Pretrained model loaded")
+        else:
+            logger.warning(f"Checkpoint not found: {checkpoint_path}")
+    
+    # Use standard loss (weighting applied via callback)
+    loss_func = LabelSmoothingCrossEntropyFlat()
+    
+    # Setup callbacks
+    cbs = []
+    
+    if skip_valid:
+        cbs.append(SkipValidationCallback())
+    
+    if enable_time_masking:
+        time_mask_cb = ProgressiveTimeMaskingCallback(
+            min_timesteps=min_timesteps,
+            max_timesteps=114,
+            prob=masking_prob
+        )
+        cbs.append(time_mask_cb)
+        logger.info(f"✓ Progressive masking: prob={masking_prob}, min={min_timesteps} steps")
+    
+    if enable_sample_weighting:
+        # Use the weighted loss callback approach
+        weight_cb = WeightedLossCallback(loss_func, early_weight=early_weight)
+        cbs.append(weight_cb)
+        logger.info(f"✓ Sample weighting: early_weight={early_weight}")
+    
+    # Create learner
+    learn = Learner(
+        mixed_dls,
+        backbone,
+        loss_func=loss_func,
+        metrics=None,
+        cbs=cbs
+    )
+    
+    # Log configuration
+    logger.info("="*80)
+    logger.info("TRAINING WITH EARLY PREDICTION OPTIMIZATION")
+    logger.info("="*80)
+    logger.info(f"  Model: {model_name}")
+    logger.info(f"  Epochs: {n_epochs}, LR: {lr}")
+    logger.info(f"  Time masking: {enable_time_masking}")
+    logger.info(f"  Sample weighting: {enable_sample_weighting}")
+    logger.info("="*80)
+    
+    # Train
+    learn.fit_one_cycle(n_epochs, lr)
+    
+    # Save
+    learn.save(model_name)
+    logger.info(f"✓ Model saved: {model_name}")
+    
+    clear_mem()
+    return learn

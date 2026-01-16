@@ -5,6 +5,8 @@ trauma_call_file_path: data/external/trauma_call.csv
 
 experiment_name: tranfusion
 run_name: binary
+
+model_name: '14012026'
    
 target: deceased_30d
 
@@ -20,7 +22,7 @@ concepts:
   
 
 dataset:
-  exclusion: lvl1tc
+  exclusion: 0 #lvl1tc
   overwrite: True 
   max_duration_days: 365 #now cut off using bins 
   min_bin_seq_len: 1

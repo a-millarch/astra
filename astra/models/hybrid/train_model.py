@@ -3,14 +3,14 @@ import argparse
 from astra.utils import logger, cfg, logger
 from astra.evaluation.hybrid_model import run_eval
 
-from astra.data.dataloader import prepare_data_and_dls
-from astra.models.hybrid.training import run_pretrain, run_finetune
+from astra.data.dataloader import prepare_data_and_dls, save_normalization_artifacts
+from astra.models.hybrid.training import run_pretrain, run_finetune, run_finetune_early_prediction_optimized
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description='MLM Pretraining + Fine-tuning Pipeline')
     
-    parser.add_argument('--model-name', '-m', default='10122025', help='Model name')
+    parser.add_argument('--model-name', '-m', default='13012025', help='Model name')
     parser.add_argument('--lr', type=float, default=4.7863e-4, help='Learning rate')
     parser.add_argument('--finetune-epochs', type=int, default=22, help='Fine-tune epochs')
     
@@ -23,7 +23,9 @@ def parse_args():
     parser.add_argument('--no-eval', dest='eval', action='store_false')
     
     # New eval flag
-    parser.add_argument('--comprehensive-eval', action='store_true', default=True,
+    parser.add_argument('--comprehensive-eval', action='store_true', default=False,
+                       help='Run full time-dependent evaluation (default)')
+    parser.add_argument('--multicurve', action='store_true', default=True,
                        help='Run full time-dependent evaluation (default)')
     parser.add_argument('--simple-eval', dest='comprehensive_eval', action='store_false',
                        help='Run simple single-point evaluation')
@@ -50,7 +52,7 @@ def main():
     
     if args.eval:
         logger.info("=== Running Evaluation ===")
-        results = run_eval(data, args.model_name, args.comprehensive_eval)
+        results, preds_df = run_eval(data, args.model_name, args.multicurve,args.comprehensive_eval)
         if args.comprehensive_eval:
             logger.info(f"Generated {len(results[0])} time points with CIs")
 
