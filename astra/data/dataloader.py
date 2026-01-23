@@ -141,7 +141,6 @@ def prepare_data_and_dls(cfg):
     tfms = [None, [Categorize()]]
     batch_tfms = None  # ← REMOVED! No more batch-level standardization
     procs = [Categorify, FillMissing]  # ← REMOVED Normalize!
-    logger.info(f'1 {cfg["target"]}')
     # Get classes from combined data
     complete_tab_dls = get_tabular_dls(
         pd.concat([trainval.tab_df, holdout.tab_df]),
@@ -154,7 +153,6 @@ def prepare_data_and_dls(cfg):
         shuffle=False
     )
     classes = complete_tab_dls.classes
-    logger.info(f'2 {cfg["target"]}')
     # ============================================================================
     # TRAINVAL DATA EXTRACTION
     # ============================================================================
@@ -314,7 +312,7 @@ def prepare_data_and_dls(cfg):
         drop_last=False,
         shuffle=False
     )
-    logger.info(f'5 {cfg["target"]}')
+
     # TRANSFORM holdout using fitted categorical encoder (CRITICAL!)
     test_ts_cat_dls, holdout_encoding_info, _ = dfwide2ts_dls(
         holdout.complete_cat, 

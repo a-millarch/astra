@@ -6,7 +6,7 @@ trauma_call_file_path: data/external/trauma_call.csv
 experiment_name: tranfusion
 run_name: binary
 
-model_name: '14012026'
+model_name: '23012026'
    
 target: deceased_30d
 

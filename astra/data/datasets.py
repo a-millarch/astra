@@ -1,8 +1,517 @@
-from astra.utils import logger, cfg, get_concept
-
-
-
 import pandas as pd
+import numpy as np 
+from typing import List, Dict, Optional, Union
+import warnings
+
+from astra.utils import logger, cfg, get_concept
+from astra.data.filters import collect_filter
+
+class AggregatedDS:
+    """
+    High-performance dataset class that aggregates time series data into tabular format.
+    
+    Optimizations:
+    - Vectorized operations (no patient loops)
+    - GPU acceleration with cuDF/CuPy (if available)
+    - Efficient memory management
+    - Parallel aggregations
+    
+    Parameters
+    ----------
+    cfg : dict
+        Configuration dictionary containing dataset parameters
+    base_df : pd.DataFrame
+        Base dataframe containing patient IDs, target, and baseline features
+    masking_point : str or pd.Timedelta, optional
+        Time offset from patient start time to mask data
+    agg_funcs : list of str, optional
+        Aggregation functions to apply
+    concepts : list of str, optional
+        Concept names to aggregate
+    use_gpu : bool, optional
+        Whether to use GPU acceleration if available. Default: True
+    default_mode : bool, optional
+        If True, automatically loads and aggregates concepts. Default: True
+    """
+    
+    def __init__(
+        self,
+        cfg: dict,
+        base_df: pd.DataFrame,
+        masking_point: Optional[Union[str, pd.Timedelta]] = None,
+        agg_funcs: Optional[List[str]] = None,
+        concepts: Optional[List[str]] = None,
+        use_gpu: bool = True,
+        default_mode: bool = True,
+    ):
+        self.cfg = cfg
+        self.target = cfg["target"]
+        #reorder by date for temporal split
+        self.base = base_df.sort_values('start').reset_index(drop=True).copy(deep=True)
+        self.masking_point = masking_point
+
+        # Try to import GPU libraries
+        try:
+            import cudf
+            import cupy as cp
+            GPU_AVAILABLE = True
+            logger.info("GPU support available (cuDF/CuPy)")
+        except ImportError:
+            GPU_AVAILABLE = False
+            logger.info("GPU support not available, using CPU-only optimizations")
+            
+        self.use_gpu = use_gpu and GPU_AVAILABLE
+        
+        if self.use_gpu:
+            logger.info("Using GPU acceleration")
+        
+        # Default aggregation functions
+        if agg_funcs is None:
+            self.agg_funcs = ['first', 'last', 'min', 'max', 'mean', 'std']
+        else:
+            self.agg_funcs = agg_funcs
+            
+        # Default concepts
+        if concepts is None:
+            self.concepts = ["VitaleVaerdier", "ITAOversigtsrapport", "Labsvar", "Medicin"]
+        else:
+            self.concepts = concepts
+        
+        # Track feature types
+        self.continuous_features = []
+        self.categorical_features = []
+        
+        # Get categorical configuration
+        cat_config = self.cfg.get("cat_time_series", {})
+        self.cat_concepts = cat_config.get("concepts", {})
+        self.multi_label_concepts = cat_config.get("multi_label", [])
+        
+        if default_mode:
+            self.set_tab_df()
+            self.collect_and_aggregate_concepts()
+            self.create_final_dataset()
+
+    def set_tab_df(self):
+        """Initialize the base tabular dataframe."""
+        id_col = self.cfg["dataset"]["id_col"]
+        num_cols = self.cfg["dataset"]["num_cols"]
+        cat_cols = self.cfg["dataset"]["cat_cols"]
+        
+        self.tab_df = self.base[[id_col, self.target] + num_cols + cat_cols].copy()
+        self.tab_df[num_cols] = self.tab_df[num_cols].astype(float)
+        
+        self.continuous_features.extend(num_cols)
+        self.categorical_features.extend(cat_cols)
+        
+        logger.debug(f"Base tabular columns: {self.tab_df.columns.tolist()}")
+
+    def _parse_masking_point(self) -> Optional[pd.Timedelta]:
+        """Convert masking point to pd.Timedelta."""
+        if self.masking_point is None:
+            return None
+        if isinstance(self.masking_point, pd.Timedelta):
+            return self.masking_point
+        if isinstance(self.masking_point, str):
+            return pd.Timedelta(self.masking_point)
+        raise ValueError(f"Invalid masking_point type: {type(self.masking_point)}")
+
+    def collect_and_aggregate_concepts(self):
+        """Collect, filter, mask, and aggregate all concepts."""
+        self.aggregated_concepts = {}
+        masking_delta = self._parse_masking_point()
+        
+        for concept in self.concepts:
+            logger.info(f"Processing concept: {concept}")
+            
+            try:
+                # Load and filter
+                concept_data = self._load_and_filter_concept(concept)
+                
+                if len(concept_data) == 0:
+                    logger.warning(f"No data for {concept}")
+                    continue
+                
+                # Apply masking (vectorized)
+                if masking_delta is not None:
+                    concept_data = self._apply_masking_vectorized(concept_data, masking_delta)
+                    logger.debug(f"After masking: {len(concept_data)} rows")
+                
+                if len(concept_data) == 0:
+                    logger.warning(f"No data after masking for {concept}")
+                    continue
+                
+                # Determine if categorical
+                is_categorical = concept in self.cat_concepts
+                is_multi_label = concept in self.multi_label_concepts
+                
+                # Aggregate
+                aggregated_df = self._aggregate_concept_optimized(
+                    concept_data, concept, is_categorical, is_multi_label
+                )
+                
+                self.aggregated_concepts[concept] = aggregated_df
+                logger.info(f"Aggregated {concept}: {aggregated_df.shape}")
+                
+            except Exception as e:
+                logger.error(f"Failed to process {concept}: {e}")
+                continue
+
+    def _load_and_filter_concept(self, concept: str) -> pd.DataFrame:
+        """
+        Load concept and apply filter function.
+        
+        Optimized: Load directly and filter in one step.
+        """
+        # Load
+        concept_path = f"data/interim/concepts/{concept}.pkl"
+        try:
+            df = pd.read_pickle(concept_path)
+        except FileNotFoundError:
+            concept_path = f"data/interim/concepts/{concept}.csv"
+            df = pd.read_csv(concept_path, low_memory=False)
+        
+        # Apply filter
+        filter_function = collect_filter(concept)
+        filtered_df = filter_function(df)
+        
+        # Filter to PIDs in base (early filtering)
+        filtered_df = filtered_df[filtered_df['PID'].isin(self.base['PID'].unique())].copy()
+        
+        # Ensure TIMESTAMP is datetime
+        if 'TIMESTAMP' in filtered_df.columns:
+            if not pd.api.types.is_datetime64_any_dtype(filtered_df['TIMESTAMP']):
+                filtered_df['TIMESTAMP'] = pd.to_datetime(filtered_df['TIMESTAMP'])
+        
+        logger.debug(f"Loaded & filtered {concept}: {len(filtered_df)} rows")
+        return filtered_df[['PID', 'FEATURE', 'VALUE', 'TIMESTAMP']]
+
+    def _apply_masking_vectorized(
+        self, 
+        concept_data: pd.DataFrame, 
+        masking_delta: pd.Timedelta
+    ) -> pd.DataFrame:
+        """
+        Apply masking using vectorized operations (NO LOOPS).
+        
+        This is the key optimization: instead of looping over patients,
+        we merge start times and filter in one vectorized operation.
+        """
+        if 'start' not in self.base.columns:
+            logger.warning("No 'start' column, using min timestamp per patient")
+            # Vectorized: compute min timestamp per patient
+            patient_starts = concept_data.groupby('PID')['TIMESTAMP'].min().reset_index()
+            patient_starts.columns = ['PID', 'start']
+        else:
+            patient_starts = self.base[['PID', 'start']].copy()
+            if not pd.api.types.is_datetime64_any_dtype(patient_starts['start']):
+                patient_starts['start'] = pd.to_datetime(patient_starts['start'])
+        
+        # Merge start times onto concept data (vectorized)
+        with_starts = concept_data.merge(patient_starts, on='PID', how='left')
+        
+        # Calculate cutoff time (vectorized)
+        with_starts['cutoff'] = with_starts['start'] + masking_delta
+        
+        # Filter in one vectorized operation
+        masked = with_starts[with_starts['TIMESTAMP'] <= with_starts['cutoff']].copy()
+        
+        # Drop helper columns
+        masked = masked[['PID', 'FEATURE', 'VALUE', 'TIMESTAMP']]
+        
+        return masked
+
+    def _aggregate_concept_optimized(
+        self,
+        concept_data: pd.DataFrame,
+        concept_name: str,
+        is_categorical: bool = False,
+        is_multi_label: bool = False
+    ) -> pd.DataFrame:
+        """
+        Optimized aggregation using GPU or efficient pandas operations.
+        """
+        # Apply drop_features filter if specified
+        if "drop_features" in self.cfg and concept_name in self.cfg["drop_features"]:
+            drop_features = self.cfg["drop_features"][concept_name]
+            concept_data = concept_data[~concept_data['FEATURE'].isin(drop_features)]
+        
+        if len(concept_data) == 0:
+            return pd.DataFrame()
+        
+        if is_categorical:
+            return self._aggregate_categorical_optimized(concept_data, concept_name)
+        else:
+            return self._aggregate_numeric_optimized(concept_data, concept_name)
+
+    def _aggregate_categorical_optimized(
+        self,
+        concept_data: pd.DataFrame,
+        concept_name: str
+    ) -> pd.DataFrame:
+        """
+        Optimized categorical aggregation.
+        
+        Creates binary indicators and counts in parallel.
+        """
+        unique_values = concept_data['VALUE'].unique()
+        
+        if len(unique_values) == 0:
+            return pd.DataFrame()
+        
+        # Use pivot_table for fast aggregation
+        # Count occurrences per patient-value pair
+        value_counts = (
+            concept_data.groupby(['PID', 'VALUE'])
+            .size()
+            .reset_index(name='count')
+        )
+        
+        # Create given (binary) from count
+        value_counts['given'] = (value_counts['count'] > 0).astype(int)
+        
+        # Pivot both count and given
+        result_dfs = []
+        
+        for value in unique_values:
+            if pd.isna(value):
+                continue
+            
+            value_clean = str(value).replace(' ', '_').replace('/', '_').replace('-', '_')
+            
+            value_data = value_counts[value_counts['VALUE'] == value][['PID', 'given', 'count']]
+            value_data.columns = [
+                'PID',
+                f'{value_clean}_{concept_name}_given',
+                f'{value_clean}_{concept_name}_count'
+            ]
+            
+            result_dfs.append(value_data)
+            
+            # Track features
+            self.categorical_features.append(f'{value_clean}_{concept_name}_given')
+            self.continuous_features.append(f'{value_clean}_{concept_name}_count')
+        
+        # Merge all values efficiently
+        if result_dfs:
+            from functools import reduce
+            result = reduce(
+                lambda left, right: left.merge(right, on='PID', how='outer'),
+                result_dfs
+            )
+            result = result.fillna(0)
+            return result
+        
+        return pd.DataFrame()
+
+    def _aggregate_numeric_optimized(
+        self,
+        concept_data: pd.DataFrame,
+        concept_name: str
+    ) -> pd.DataFrame:
+        """
+        Highly optimized numeric aggregation.
+        
+        Key optimizations:
+        1. Single groupby with multiple aggregations
+        2. GPU acceleration if available
+        3. Efficient pivoting
+        """
+        # Convert to numeric
+        concept_data = concept_data.copy()
+        concept_data['VALUE_numeric'] = pd.to_numeric(concept_data['VALUE'], errors='coerce')
+        
+        # Remove non-numeric
+        valid_data = concept_data[concept_data['VALUE_numeric'].notna()].copy()
+        
+        if len(valid_data) == 0:
+            return pd.DataFrame()
+        
+        # Try GPU acceleration
+        if self.use_gpu:
+            try:
+                return self._aggregate_numeric_gpu(valid_data, concept_name)
+            except Exception as e:
+                logger.warning(f"GPU aggregation failed, falling back to CPU: {e}")
+        
+        # CPU optimized version
+        return self._aggregate_numeric_cpu(valid_data, concept_name)
+
+    def _aggregate_numeric_gpu(
+        self,
+        valid_data: pd.DataFrame,
+        concept_name: str
+    ) -> pd.DataFrame:
+        """
+        GPU-accelerated numeric aggregation using cuDF.
+        """
+        # Convert to cuDF
+        gdf = cudf.from_pandas(valid_data)
+        
+        # Build aggregation dict
+        agg_dict = {}
+        for agg_func in self.agg_funcs:
+            if agg_func in ['first', 'last']:
+                # Sort once for first/last
+                if agg_func not in agg_dict:
+                    gdf_sorted = gdf.sort_values('TIMESTAMP')
+                    if agg_func == 'first':
+                        agg_result = gdf_sorted.groupby(['PID', 'FEATURE'])['VALUE_numeric'].first()
+                    else:
+                        agg_result = gdf_sorted.groupby(['PID', 'FEATURE'])['VALUE_numeric'].last()
+                    agg_dict[agg_func] = agg_result
+            else:
+                # Standard aggregations
+                agg_dict[agg_func] = (
+                    gdf.groupby(['PID', 'FEATURE'])['VALUE_numeric']
+                    .agg(agg_func)
+                )
+        
+        # Convert results to pandas and pivot
+        result_dfs = []
+        for agg_func, agg_data in agg_dict.items():
+            # Convert to pandas
+            agg_df = agg_data.to_pandas().reset_index()
+            
+            # Pivot
+            pivoted = agg_df.pivot(
+                index='PID',
+                columns='FEATURE',
+                values='VALUE_numeric'
+            )
+            
+            # Rename columns
+            pivoted.columns = [f"{col}_{concept_name}_{agg_func}" for col in pivoted.columns]
+            
+            # Track features
+            self.continuous_features.extend(pivoted.columns.tolist())
+            
+            result_dfs.append(pivoted)
+        
+        # Concatenate all aggregations
+        result = pd.concat(result_dfs, axis=1).reset_index()
+        result = result.fillna(0.0)
+        
+        return result
+
+    def _aggregate_numeric_cpu(
+        self,
+        valid_data: pd.DataFrame,
+        concept_name: str
+    ) -> pd.DataFrame:
+        """
+        CPU-optimized numeric aggregation.
+        
+        Key optimization: Single groupby with multiple aggregations at once.
+        """
+        # Sort once for first/last
+        valid_data_sorted = valid_data.sort_values('TIMESTAMP')
+        
+        # Build aggregation dictionary
+        agg_operations = {}
+        for agg_func in self.agg_funcs:
+            if agg_func == 'first':
+                agg_operations['first'] = 'first'
+            elif agg_func == 'last':
+                agg_operations['last'] = 'last'
+            elif agg_func in ['min', 'max', 'mean', 'std', 'count', 'median']:
+                agg_operations[agg_func] = agg_func
+        
+        # Single groupby with multiple aggregations (MUCH FASTER)
+        grouped = valid_data_sorted.groupby(['PID', 'FEATURE'])['VALUE_numeric'].agg(
+            list(agg_operations.values())
+        ).reset_index()
+        
+        # Rename aggregation columns
+        grouped.columns = ['PID', 'FEATURE'] + list(agg_operations.keys())
+        
+        # Pivot each aggregation
+        result_dfs = []
+        for agg_func in agg_operations.keys():
+            if agg_func not in grouped.columns:
+                continue
+            
+            # Pivot this aggregation
+            pivoted = grouped[['PID', 'FEATURE', agg_func]].pivot(
+                index='PID',
+                columns='FEATURE',
+                values=agg_func
+            )
+            
+            # Rename columns
+            pivoted.columns = [f"{col}_{concept_name}_{agg_func}" for col in pivoted.columns]
+            
+            # Track features
+            self.continuous_features.extend(pivoted.columns.tolist())
+            
+            result_dfs.append(pivoted)
+        
+        # Concatenate all aggregations
+        result = pd.concat(result_dfs, axis=1).reset_index()
+        result = result.fillna(0.0)
+        
+        return result
+
+    def create_final_dataset(self):
+        """Merge all aggregated concepts with base tabular data."""
+        final_df = self.tab_df.copy()
+        id_col = self.cfg["dataset"]["id_col"]
+        
+        # Merge all concepts at once (more efficient)
+        for concept_name, agg_df in self.aggregated_concepts.items():
+            if len(agg_df) > 0:
+                pre_merge_len = len(final_df)
+                final_df = final_df.merge(agg_df, left_on=id_col, right_on='PID', how='left')
+                
+                if 'PID' in final_df.columns and id_col != 'PID':
+                    final_df = final_df.drop(columns=['PID'])
+                
+                assert len(final_df) == pre_merge_len, f"Merge changed row count for {concept_name}"
+                logger.info(f"Merged {concept_name}: {len(agg_df.columns)-1} features")
+        
+        # Fill NaN
+        feature_cols = [col for col in final_df.columns if col not in [id_col, self.target]]
+        final_df[feature_cols] = final_df[feature_cols].fillna(0.0)
+        
+        self.final_df = final_df
+        
+        # Remove duplicates
+        self.continuous_features = list(dict.fromkeys(self.continuous_features))
+        self.categorical_features = list(dict.fromkeys(self.categorical_features))
+        
+        logger.info(f"Final dataset: {final_df.shape}")
+        logger.info(f"Features: {len(self.continuous_features)} cont + {len(self.categorical_features)} cat")
+
+    def get_features_by_type(self) -> Dict[str, List[str]]:
+        """Get feature names by type."""
+        return {
+            'continuous': self.continuous_features,
+            'categorical': self.categorical_features
+        }
+
+    def get_X_y(self, include_id: bool = False):
+        """Get feature matrix and target."""
+        id_col = self.cfg["dataset"]["id_col"]
+        
+        if include_id:
+            X = self.final_df.drop(columns=[self.target])
+        else:
+            X = self.final_df.drop(columns=[id_col, self.target])
+        
+        y = self.final_df[self.target]
+        
+        return X, y
+
+    def to_csv(self, filepath: str):
+        """Save to CSV."""
+        self.final_df.to_csv(filepath, index=False)
+        logger.info(f"Saved to {filepath}")
+    
+    def to_pickle(self, filepath: str):
+        """Save to pickle."""
+        self.final_df.to_pickle(filepath)
+        logger.info(f"Saved to {filepath}")
+
+
 
 class TSDS:
     def __init__(
@@ -10,12 +519,16 @@ class TSDS:
         cfg,
         base_df,
         default_mode=True,
-        concepts=["VitaleVaerdier", "ITAOversigtsrapport", "Labsvar", "Medicin"],
+        concepts=None
     ):
         self.cfg = cfg
         self.target = cfg["target"]
         self.base = base_df
-        self.concepts = concepts
+        
+        if concepts is None:
+            self.concepts=self.cfg["concepts"]
+        else:
+            self.concepts = concepts
 
         if default_mode:
             self.set_tab_df()
@@ -23,25 +536,38 @@ class TSDS:
             
 
     def set_tab_df(self):
-        self.tab_df = self.base[[cfg["dataset"]["id_col"],cfg["target"]]+cfg["dataset"]["num_cols"]+cfg["dataset"]["cat_cols"]]
+        self.tab_df = self.base[[cfg["dataset"]["id_col"],cfg["target"]]+cfg["dataset"]["num_cols"]+cfg["dataset"]["cat_cols"]].copy(deep=True)
         self.tab_df[cfg["dataset"]["num_cols"]] = self.tab_df[cfg["dataset"]["num_cols"]].astype(float)
         logger.debug(self.base.columns)
 
 
+    
     def collect_concepts(self):
         concepts = {}
         concepts_raw = {}
+        self.timestep_cols = []
         for concept in self.concepts:
             logger.debug(f"getting {concept}")
             concepts_raw[concept] = get_concept(concept, self.cfg)
+
             logger.debug(f"getting long version of {concept}")
-            concepts[concept] = get_long_concept_df(
-                self.base.copy(deep=True),
-                concepts_raw[concept],
-                concept,
-                self.cfg["target"],
-                self.cfg["bin_freq_include"],
-            )
+            if concept in self.cfg["dataset"]["ts_cat_names"]:
+                agg_func_name = self.cfg["agg_func"][concept]
+                concept_long_df = concepts_raw[concept][cfg["agg_func"][concept][0]].copy(deep=True)
+                concepts[concept] = _get_long_concept_df_multi_label(concept_long_df,self.base.copy(deep=True), self.cfg)
+                # specifcy max ts dims 
+                if len(concepts[concept].timestep_cols) > len(self.timestep_cols):
+                    self.timestep_cols = concepts[concept].timestep_cols
+            else:
+                concepts[concept] = _get_long_concept_df_single_label(
+                    self.cfg,
+                    self.base.copy(deep=True),
+                    concepts_raw[concept],
+                    concept,
+                    self.cfg["target"],
+                    self.cfg["bin_freq_include"],   
+                )
+
         self.concepts = concepts
         self.concepts_raw = concepts_raw
 
@@ -56,129 +582,149 @@ class TSDS:
             self.vitals = self.vitals.fillna(0.0)
 
 
-class HistoricDS:
-    def __init__(self, cfg, base_df):
-        self.cfg = cfg
-        self.base = base_df
-        self.target = cfg["target"]
-        self.tab_df = self.base[[cfg["dataset"]["id_col"],cfg["target"]]+cfg["dataset"]["num_cols"]+cfg["dataset"]["cat_cols"]]
-        self.tab_df[cfg["dataset"]["num_cols"]] = self.tab_df[cfg["dataset"]["num_cols"]].astype(float)
-        logger.debug(self.base.columns)
-    
-    def add_comorbidity(self):
-        """Add Elixhauser and ISS to base"""
-        
-        # ELIXHAUSER    
-        while True:
-            try:
-                elix = pd.read_csv('data/interim/ISS_ELIX/computed_elix_df.csv',
-                                   low_memory =False)
-                logger.info('Elixhauser df dataframe found, continuing') 
-                baselen =len(self.base)
-                # merge
-                self.base= self.base.merge(elix[["PID", "elixscore"]], 
-                                           how='left', on='PID')
-                assert baselen-len(self.base) == 0
-                logger.info('Merged Elix onto base')
-            # TODO: merge onto base
-            except FileNotFoundError:
-                logger.info('No Elixhauser computed, creating.')
-                add_elixhauser(self.base)
-                continue
-            break
-           
-
-
-def get_long_concept_df(
+def _get_long_concept_df_single_label(
+    cfg: Dict,
     base: pd.DataFrame,
-    vitals: dict,
+    concepts: Dict,
     concept: str,
     target: str,
-    bin_freq_include: list = None,) -> pd.DataFrame:
+    bin_freq_include: Optional[List],
+    
+) -> pd.DataFrame:
+    """
+    Process single-label data: PIVOT to wide format.
+    This is the original behavior.
+    """
     pivoted = []
+    
     for agg_func in cfg["agg_func"][concept]:
-        logger.debug(f"long df {agg_func}")
-        df = vitals[agg_func]
+        logger.debug(f"Single-label: {concept} with {agg_func}")
+        df = concepts[agg_func].copy()
+        
         if bin_freq_include is not None:
-            logger.debug("Reducing to limited bin frequencies")
             df = df[df.bin_freq.isin(bin_freq_include)]
-            #logger.debug(print(df))
+        
         try:
             df = df[
-                (~df.FEATURE.isin(cfg["drop_features"][concept]))
-                & (df.PID.isin(base.PID.unique()))
+                (~df.FEATURE.isin(cfg["drop_features"].get(concept, []))) &
+                (df.PID.isin(base.PID.unique()))
             ][["PID", "bin_counter", "FEATURE", "VALUE"]]
         except:
-            df = df[(df.PID.isin(base.PID.unique()))][
-                ["PID", "bin_counter", "FEATURE", "VALUE"]
-            ]
-
-        # Pivot the dataframe
+            df = df[
+                (df.PID.isin(base.PID.unique()))
+            ][["PID", "bin_counter", "FEATURE", "VALUE"]]
+        
+        # Convert to numeric
+        try:
+            df['VALUE'] = pd.to_numeric(df['VALUE'])
+        except (ValueError, TypeError):
+            pass  # Keep as string if conversion fails
+        
+        # Pivot the dataframe (safe because single-label = no duplicates)
         pivoted_df = df.pivot(
-            index=["PID", "FEATURE"], columns="bin_counter", values="VALUE"
+            index=["PID", "FEATURE"], 
+            columns="bin_counter", 
+            values="VALUE"
         )
-
-        # Reset the index to make PID and FEATURE regular columns
+        
         pivoted_df = pivoted_df.reset_index()
-
-        # Rename the columns (bin_counter columns will be 0, 1, 2, ...)
         pivoted_df.columns.name = None
         pivoted_df.columns = ["PID", "FEATURE"] + [
             f"{i}" for i in range(len(pivoted_df.columns) - 2)
         ]
-
-        # Sort the dataframe by PID and FEATURE
-        pivoted_df = pivoted_df.sort_values(["PID", "FEATURE"])
-
-        # Reset the index to have a clean, sequential index
-        pivoted_df = pivoted_df.reset_index(drop=True)
-
-        # Step 1: Get unique PIDs and FEATUREs
-        # important: use an absolute lit of PIDS e.g. by base
+        
+        pivoted_df = pivoted_df.sort_values(["PID", "FEATURE"]).reset_index(drop=True)
+        
+        # Create complete set of PID-FEATURE combinations
         unique_pids = base["PID"].unique()
         unique_features = pivoted_df["FEATURE"].unique()
-
-        # Step 2: Create a complete set of PID-FEATURE combinations
+        
         complete_set = pd.MultiIndex.from_product(
-            [unique_pids, unique_features], names=["PID", "FEATURE"]
+            [unique_pids, unique_features], 
+            names=["PID", "FEATURE"]
         )
         complete_df = pd.DataFrame(index=complete_set).reset_index()
-
-        # Step 3: Merge the complete set with the original dataframe
+        
         merged_df = complete_df.merge(pivoted_df, on=["PID", "FEATURE"], how="left")
-
-        # Step 4: Fill missing values in numeric columns with 0
+        
+        # Fill missing values
         numeric_cols = [col for col in merged_df.columns if col.isdigit()]
-        merged_df[numeric_cols] = merged_df[numeric_cols].fillna(0)
-
-        # Sort the dataframe if needed
+        if len(numeric_cols) > 0 and pd.api.types.is_numeric_dtype(merged_df[numeric_cols[0]]):
+            merged_df[numeric_cols] = merged_df[numeric_cols].fillna(0)
+        
         merged_df = merged_df.sort_values(["PID", "FEATURE"])
-
-        # Rename feature values for later concat
-        col_mapper = dict(
-            zip(
-                df.FEATURE.unique(),
-                [col + f"_{agg_func}" for col in df.FEATURE.unique()],
-            )
-        )
+        
+        # Rename features
+        col_mapper = {
+            feat: f"{feat}_{agg_func}" 
+            for feat in df.FEATURE.unique()
+        }
         merged_df["FEATURE"] = merged_df["FEATURE"].replace(col_mapper)
-        # Reset the index
+        
         pivoted_df = merged_df.reset_index(drop=True)
-
         pivoted_df = pivoted_df[pivoted_df.FEATURE.notnull()]
-
+        
         pivoted.append(pivoted_df)
-    # Concat all features into on df
-    complete = pd.concat(pivoted).fillna(0.0)
-
-    # Merge target onto long df
+    
+    # Concat all aggregation functions
+    complete = pd.concat(pivoted, ignore_index=True)
+    
+    # Fill NaN in numeric columns
+    numeric_cols = [col for col in complete.columns if col.isdigit()]
+    for col in numeric_cols:
+        if pd.api.types.is_numeric_dtype(complete[col]):
+            complete[col] = complete[col].fillna(0.0)
+    
+    # Merge target
     prelen = len(complete)
-    complete = complete.merge(base[["PID", target]], on="PID", how="left")
+    complete = complete.merge(base[["PID", target]].copy(deep=True), on="PID", how="left")
     complete[target] = complete[target].astype(int)
-    assert prelen - len(complete) == 0
-
-    # Quality control and reset index
-    complete = complete[complete.FEATURE.notnull()]
-    complete = complete.reset_index(drop=True)
-
+    assert prelen == len(complete), f"Length mismatch: {prelen} vs {len(complete)}"
+    
+    complete = complete[complete.FEATURE.notnull()].reset_index(drop=True)
+    
     return complete
+
+def _get_long_concept_df_multi_label(df_long:pd.DataFrame, base:pd.DataFrame,  cfg):
+    logger.debug(f"Initial PID count {df_long.PID.nunique()}")
+    df_long = df_long[df_long.bin_freq.isin(cfg["bin_freq_include"])].copy(deep=True)
+    logger.debug(f">>minus bin freq: {df_long.PID.nunique()}")
+    df_long = df_long[['PID', 'bin_counter','FEATURE', 'VALUE']].rename(columns={'bin_counter':'TIMESTEP'})
+    df_long["TIMESTEP"] = df_long["TIMESTEP"]-1 # matching df2xy function index 0
+    # Pivot to wide format (your format)
+    df_wide = df_long.pivot_table(
+      index=['PID', 'FEATURE'],
+      columns='TIMESTEP',
+      values='VALUE',
+      aggfunc=lambda x: list(x) if len(x) > 1 else x.iloc[0],
+      dropna=False
+    ).reset_index()
+    # keep all timesteps, fill in feature name
+    feat_name = df_wide.FEATURE.dropna().unique()
+    assert len(feat_name == 1)
+    df_wide['FEATURE'] = feat_name[0]
+    df_wide.timestep_cols = [i for i in range(0,df_long.TIMESTEP.max())]
+    logger.debug(base.PID.nunique())
+    df_wide = df_wide[df_wide.PID.isin(base.PID.unique())].reset_index(drop=True)
+    logger.debug(f">>> after wide: {df_wide.PID.nunique()}")
+    df_wide.timestep_cols = [i for i in range(0,df_long.TIMESTEP.max())]
+    return df_wide
+
+def get_concept(concept: str, cfg: Dict) -> Dict:
+    """Get concept from mapped files."""
+    drop_cols = cfg["drop_features"].get(concept, [])
+    concept_dict = {}
+    
+    for agg_func in cfg["agg_func"][concept]:
+        df = pd.read_csv(f"data/interim/mapped/{concept}_{agg_func}.csv")
+    
+        if concept not in cfg["dataset"]["ts_cat_names"]:
+            try:
+                df = df[~df.FEATURE.isin(drop_cols + [np.nan])]
+            except:
+                df = df[~df.FEATURE.isin([np.nan])]
+        
+        concept_dict[agg_func] = df
+    
+    return concept_dict
+

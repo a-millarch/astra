@@ -597,7 +597,8 @@ def filter_medicin(med):
     med = pd.concat([med3, med4]).drop_duplicates()
     med = med[med["FEATURE"].notnull()]
     # set value to binary, consider changing to actual values of daily dosage or smth
-    med["VALUE"] = 1
+    med["VALUE"] = med["FEATURE"] #CHANGED!
+    med["FEATURE"] = "medication" #CHANGED!
 
     # rename for convenience
     med.rename(
