@@ -442,10 +442,10 @@ def filter_procedures(proc):
 
     # rename cols to adherence
     proc.rename(
-        columns={"ProcedureCode": "FEATURE", "ServiceDatetime": "TIMESTAMP"},
+        columns={"ProcedureCode": "VALUE", "ServiceDatetime": "TIMESTAMP"},
         inplace=True,
     )
-    proc["VALUE"] = 1
+    proc["FEATURE"] = "procedures"
 
     # Replace feature
     proc.FEATURE = proc.FEATURE.replace(reversed_feature_map)
